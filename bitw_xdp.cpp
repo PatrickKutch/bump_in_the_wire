@@ -18,6 +18,9 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 #include <xdp/xsk.h>
 #include <linux/if_link.h> // XDP_FLAGS_*
@@ -29,6 +32,39 @@
 #ifndef XSK_BIND_FLAGS_ZEROCOPY
 #define XSK_BIND_FLAGS_ZEROCOPY (1u << 0)
 #endif
+
+// -----------------------------------------------------------------------------
+// Logging utilities for container-friendly output
+// -----------------------------------------------------------------------------
+enum class LogLevel { DEBUG, INFO, WARN, ERROR };
+
+static const char* log_level_str(LogLevel level) {
+    switch (level) {
+        case LogLevel::DEBUG: return "DEBUG";
+        case LogLevel::INFO:  return "INFO";
+        case LogLevel::WARN:  return "WARN";
+        case LogLevel::ERROR: return "ERROR";
+        default: return "UNKNOWN";
+    }
+}
+
+static std::string get_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&time_t), "%Y-%m-%dT%H:%M:%S")
+       << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
+    return ss.str();
+}
+
+#define LOG(level, ...) do { \
+    std::fprintf(stderr, "[%s] [%s] ", get_timestamp().c_str(), log_level_str(level)); \
+    std::fprintf(stderr, __VA_ARGS__); \
+    std::fprintf(stderr, "\n"); \
+} while(0)
 
 // -----------------------------------------------------------------------------
 // Simple resource structs
@@ -125,6 +161,83 @@ static inline bool parse_ethertype_vlan_aware(const uint8_t* frame, uint32_t len
 }
 
 // -----------------------------------------------------------------------------
+// S-Flow sampling configuration
+// -----------------------------------------------------------------------------
+struct SFlowConfig {
+    uint32_t sampling_rate = 0;  // 0 = disabled, N = sample 1 out of N packets
+    std::vector<uint16_t> ethertypes;
+    bool skip_vlan = true;       // true = skip VLAN tags to find EtherType
+    
+    bool is_enabled() const { return sampling_rate > 0 && !ethertypes.empty(); }
+};
+
+static bool parse_ethertypes(const char* str, std::vector<uint16_t>& ethertypes) {
+    ethertypes.clear();
+    if (!str || !*str) return false;
+    
+    std::string input(str);
+    size_t pos = 0;
+    
+    while (pos < input.length()) {
+        size_t comma = input.find(',', pos);
+        std::string token = input.substr(pos, comma - pos);
+        
+        // Remove whitespace
+        token.erase(0, token.find_first_not_of(" \t"));
+        token.erase(token.find_last_not_of(" \t") + 1);
+        
+        if (token.empty()) {
+            pos = (comma == std::string::npos) ? input.length() : comma + 1;
+            continue;
+        }
+        
+        // Parse hex value (with or without 0x prefix)
+        char* endptr;
+        unsigned long val = strtoul(token.c_str(), &endptr, 16);
+        if (*endptr != '\0' || val > 0xFFFF) {
+            std::cerr << "Invalid EtherType: " << token << "\n";
+            return false;
+        }
+        
+        ethertypes.push_back(static_cast<uint16_t>(val));
+        pos = (comma == std::string::npos) ? input.length() : comma + 1;
+    }
+    
+    return !ethertypes.empty();
+}
+
+// Get EtherType with optional VLAN skipping
+static inline bool get_ethertype(const uint8_t* frame, uint32_t len, uint16_t& ether_type_out, bool skip_vlan) {
+    if (skip_vlan) {
+        return parse_ethertype_vlan_aware(frame, len, ether_type_out);
+    } else {
+        // Direct EtherType read without VLAN skipping
+        if (len < 14) return false;
+        return read_be16(frame + 12, ether_type_out);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// S-Flow sampling state (per direction)
+// -----------------------------------------------------------------------------
+struct SFlowState {
+    uint32_t packet_count = 0;
+    uint32_t sampled_count = 0;
+};
+
+static void process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
+                                uint16_t ethertype, const SFlowConfig& config, 
+                                SFlowState& state) {
+    state.sampled_count++;
+    LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) skip_vlan=%s",
+        tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
+        config.skip_vlan ? "true" : "false");
+    
+    // Here you could add actual S-Flow record generation and export
+    // For now, we just log the sample
+}
+
+// -----------------------------------------------------------------------------
 // Helpers: UMEM and Socket Setup
 // -----------------------------------------------------------------------------
 int setup_umem(UmemArea& ua,
@@ -172,8 +285,7 @@ int setup_rings(const char* ifname,
 {
     int ret = xsk_socket__create(&ep.xsk, ifname, queue_id, ua.umem, &ep.rx, &ep.tx, &cfg);
     if (ret) {
-        std::fprintf(stderr,
-            "[%s] xsk_socket__create failed: ret=%d (%s) | xdp_flags=0x%x bind_flags=0x%x\n",
+        LOG(LogLevel::ERROR, "[%s] xsk_socket__create failed: ret=%d (%s) | xdp_flags=0x%x bind_flags=0x%x",
             ifname, ret, strerror(-ret), cfg.xdp_flags, cfg.bind_flags);
         return 1;
     }
@@ -216,8 +328,7 @@ int create_xsk_socket(const char* ifname,
         std::cerr << "Failed to create XSK socket on interface: " << ifname << "\n";
         return 1;
     }
-    std::cout << "Created XSK socket on interface: " << ifname
-              << " (queue " << queue_id << ")\n";
+    LOG(LogLevel::INFO, "Created XSK socket on interface: %s (queue %u)", ifname, queue_id);
     return 0;
 }
 
@@ -240,12 +351,12 @@ int create_xsk_with_fallback(const char* ifname,
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
         cfg.bind_flags = XSK_BIND_FLAGS_ZEROCOPY;
         if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            std::fprintf(stderr, "[%s] bound: DRV + ZEROCOPY ✅\n", ifname);
+            LOG(LogLevel::INFO, "[%s] bound: DRV + ZEROCOPY ✅", ifname);
             using_zerocopy = true;
             using_skb_mode = false;
             return 0;
         }
-        std::fprintf(stderr, "[%s] DRV + ZEROCOPY bind failed, will try DRV + COPY...\n", ifname);
+        LOG(LogLevel::WARN, "[%s] DRV + ZEROCOPY bind failed, will try DRV + COPY...", ifname);
     }
 
     // 2) DRV + COPY (bind_flags=0)
@@ -254,14 +365,13 @@ int create_xsk_with_fallback(const char* ifname,
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
         cfg.bind_flags = 0;
         if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            std::fprintf(stderr, "[%s] bound: DRV + COPY (no zerocopy) ✅\n", ifname);
+            LOG(LogLevel::INFO, "[%s] bound: DRV + COPY (no zerocopy) ✅", ifname);
             using_zerocopy = false;
             using_skb_mode = false;
             return 0;
         }
-        std::fprintf(stderr, "[%s] DRV + COPY bind failed", ifname);
-        if (allow_skb_fallback) std::fprintf(stderr, ", will try SKB + COPY...");
-        std::fprintf(stderr, "\n");
+        LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed%s", ifname, 
+            allow_skb_fallback ? ", will try SKB + COPY..." : "");
     }
 
     if (!allow_skb_fallback) {
@@ -275,24 +385,26 @@ int create_xsk_with_fallback(const char* ifname,
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
         cfg.bind_flags = 0;
         if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            std::fprintf(stderr, "[%s] bound: SKB + COPY (fallback) ✅\n", ifname);
+            LOG(LogLevel::INFO, "[%s] bound: SKB + COPY (fallback) ✅", ifname);
             using_zerocopy = false;
             using_skb_mode = true;
             return 0;
         }
-        std::fprintf(stderr, "[%s] SKB + COPY bind failed; giving up.\n", ifname);
+        LOG(LogLevel::ERROR, "[%s] SKB + COPY bind failed; giving up.", ifname);
     }
 
     return 1;
 }
 
 // -----------------------------------------------------------------------------
-// Forwarding: RX -> copy -> TX -> recycle (with tagged debug prints)
+// Forwarding: RX -> copy -> TX -> recycle (with S-Flow sampling)
 // -----------------------------------------------------------------------------
 void forward_step(const char* tag,
                   XskEndpoint& in_ep, UmemArea& in_umem,
                   XskEndpoint& out_ep, UmemArea& out_umem,
-                  bool debug_print = false)
+                  bool debug_print = false,
+                  const SFlowConfig* sflow_config = nullptr,
+                  SFlowState* sflow_state = nullptr)
 {
     static constexpr uint32_t BATCH = 64;
 
@@ -331,11 +443,37 @@ void forward_step(const char* tag,
             const uint8_t* frame = umem_ptr(in_umem, rx_addrs[i]);
             uint16_t et = 0;
             if (parse_ethertype_vlan_aware(frame, rx_lens[i], et)) {
-                std::fprintf(stderr, "[%s RX] len=%u ethertype=0x%04x (%s)\n",
-                             tag, rx_lens[i], et, ethertype_to_str(et));
+                LOG(LogLevel::DEBUG, "[%s RX] len=%u ethertype=0x%04x (%s)",
+                    tag, rx_lens[i], et, ethertype_to_str(et));
             } else {
-                std::fprintf(stderr, "[%s RX] len=%u ethertype=? (frame too short/malformed)\n",
-                             tag, rx_lens[i]);
+                LOG(LogLevel::DEBUG, "[%s RX] len=%u ethertype=? (frame too short/malformed)",
+                    tag, rx_lens[i]);
+            }
+        }
+    }
+    
+    // S-Flow sampling (only for A→B direction indicated by tag)
+    if (sflow_config && sflow_config->is_enabled() && sflow_state && 
+        sflow_config->sampling_rate > 0 && 
+        std::strcmp(tag, "A→B") == 0) {
+        
+        for (unsigned int i = 0; i < rcvd; ++i) {
+            sflow_state->packet_count++;
+            
+            // Check if this packet should be sampled
+            if ((sflow_state->packet_count % sflow_config->sampling_rate) == 0) {
+                const uint8_t* frame = umem_ptr(in_umem, rx_addrs[i]);
+                uint16_t et = 0;
+                
+                if (get_ethertype(frame, rx_lens[i], et, sflow_config->skip_vlan)) {
+                    // Check if this EtherType is in our sample list
+                    for (uint16_t target_et : sflow_config->ethertypes) {
+                        if (et == target_et) {
+                            process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state);
+                            break; // Only sample once per packet even if multiple matches
+                        }
+                    }
+                }
             }
         }
     }
@@ -413,8 +551,7 @@ static int pin_current_thread_to_cpu(int cpu_id) {
     pthread_t tid = pthread_self();
     int ret = pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset);
     if (ret != 0) {
-        std::fprintf(stderr, "pthread_setaffinity_np(cpu=%d) failed: %s\n",
-                     cpu_id, strerror(ret));
+        LOG(LogLevel::ERROR, "pthread_setaffinity_np(cpu=%d) failed: %s", cpu_id, strerror(ret));
         return -1;
     }
 
@@ -422,13 +559,13 @@ static int pin_current_thread_to_cpu(int cpu_id) {
     cpu_set_t checkset;
     CPU_ZERO(&checkset);
     if (pthread_getaffinity_np(tid, sizeof(checkset), &checkset) == 0) {
-        std::fprintf(stderr, "Thread affinity confirmed: ");
+        std::stringstream ss;
         for (int i = 0; i < CPU_SETSIZE; ++i) {
-            if (CPU_ISSET(i, &checkset)) std::fprintf(stderr, "%d ", i);
+            if (CPU_ISSET(i, &checkset)) ss << i << " ";
         }
-        std::fprintf(stderr, "\n");
+        LOG(LogLevel::DEBUG, "Thread affinity confirmed: %s", ss.str().c_str());
     } else {
-        std::fprintf(stderr, "Failed to verify thread affinity\n");
+        LOG(LogLevel::WARN, "Failed to verify thread affinity");
     }
 
     return 0;
@@ -443,11 +580,13 @@ void forward_worker(const char* tag,
                     XskEndpoint* out_ep, UmemArea* out_umem,
                     std::atomic<bool>* running,
                     bool debug_print,
-                    int cpu_pin /* -1 = no pin */)
+                    int cpu_pin, /* -1 = no pin */
+                    const SFlowConfig* sflow_config = nullptr,
+                    SFlowState* sflow_state = nullptr)
 {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
-            std::fprintf(stderr, "[%s] pinned to CPU %d\n", tag, cpu_pin);
+            LOG(LogLevel::INFO, "[%s] pinned to CPU %d", tag, cpu_pin);
         }
     }
 
@@ -462,7 +601,7 @@ void forward_worker(const char* tag,
             perror("poll");
             break;
         }
-        forward_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print);
+        forward_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, sflow_config, sflow_state);
     }
 }
 
@@ -474,31 +613,110 @@ struct Cmd {
     const char* devB = nullptr;
     int cpu_a = -1;
     int cpu_b = -1;
+    SFlowConfig sflow;
 };
 
 static void print_usage(const char* prog) {
     std::cerr
-        << "Usage: " << prog << " <netdev_A> <netdev_B> [--cpu-a N] [--cpu-b M]\n"
-        << "  --cpu-a N   Pin A→B worker thread to CPU N\n"
-        << "  --cpu-b M   Pin B→A worker thread to CPU M\n"
-        << "Env:\n"
-        << "  BUMP_VERBOSE=1   Enable per-packet debug prints (EtherType + length)\n";
+        << "Usage: " << prog << " <netdev_A> <netdev_B> [options]\n"
+        << "\nCPU Pinning:\n"
+        << "  --cpu-a N               Pin A→B worker thread to CPU N\n"
+        << "  --cpu-b M               Pin B→A worker thread to CPU M\n"
+        << "\nS-Flow Sampling (A→B traffic only):\n"
+        << "  --sample.sampling N     Sample 1 out of every N packets (0=disabled, e.g. 1000)\n"
+        << "  --sample.ethertypes L   Comma-separated EtherTypes to sample (e.g. 0x800,0x86DD)\n"
+        << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
+        << "\nEnvironment:\n"
+        << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + length)\n"
+        << "\nExamples:\n"
+        << "  " << prog << " eth0 eth1 --cpu-a 2 --cpu-b 3\n"
+        << "  " << prog << " PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
+        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.ethertypes=0x800 --sample.skip_vlan false\n";
 }
 
 static bool parse_args(int argc, char** argv, Cmd& cmd) {
     if (argc < 3) return false;
     cmd.devA = argv[1];
     cmd.devB = argv[2];
+    
     for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--cpu-a") == 0 && i + 1 < argc) {
-            cmd.cpu_a = std::atoi(argv[++i]);
-        } else if (std::strcmp(argv[i], "--cpu-b") == 0 && i + 1 < argc) {
-            cmd.cpu_b = std::atoi(argv[++i]);
+        std::string arg(argv[i]);
+        
+        // Handle --option=value syntax
+        size_t eq_pos = arg.find('=');
+        std::string option = (eq_pos != std::string::npos) ? arg.substr(0, eq_pos) : arg;
+        std::string value = (eq_pos != std::string::npos) ? arg.substr(eq_pos + 1) : "";
+        
+        if (option == "--cpu-a") {
+            if (eq_pos != std::string::npos) {
+                cmd.cpu_a = std::atoi(value.c_str());
+            } else if (i + 1 < argc) {
+                cmd.cpu_a = std::atoi(argv[++i]);
+            } else {
+                std::cerr << "Missing value for --cpu-a\n";
+                return false;
+            }
+        } else if (option == "--cpu-b") {
+            if (eq_pos != std::string::npos) {
+                cmd.cpu_b = std::atoi(value.c_str());
+            } else if (i + 1 < argc) {
+                cmd.cpu_b = std::atoi(argv[++i]);
+            } else {
+                std::cerr << "Missing value for --cpu-b\n";
+                return false;
+            }
+        } else if (option == "--sample.sampling") {
+            std::string rate_str = (eq_pos != std::string::npos) ? value : 
+                                  (i + 1 < argc ? argv[++i] : "");
+            if (rate_str.empty()) {
+                std::cerr << "Missing value for --sample.sampling\n";
+                return false;
+            }
+            int rate = std::atoi(rate_str.c_str());
+            if (rate < 0) {
+                std::cerr << "Invalid sampling rate: " << rate << " (must be >= 0, 0 = disabled)\n";
+                return false;
+            }
+            cmd.sflow.sampling_rate = static_cast<uint32_t>(rate);
+        } else if (option == "--sample.ethertypes") {
+            std::string types_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (types_str.empty()) {
+                std::cerr << "Missing value for --sample.ethertypes\n";
+                return false;
+            }
+            if (!parse_ethertypes(types_str.c_str(), cmd.sflow.ethertypes)) {
+                std::cerr << "Failed to parse EtherTypes\n";
+                return false;
+            }
+        } else if (option == "--sample.skip_vlan") {
+            std::string skip_str = (eq_pos != std::string::npos) ? value : 
+                                  (i + 1 < argc ? argv[++i] : "");
+            if (skip_str.empty()) {
+                std::cerr << "Missing value for --sample.skip_vlan\n";
+                return false;
+            }
+            if (skip_str == "true") {
+                cmd.sflow.skip_vlan = true;
+            } else if (skip_str == "false") {
+                cmd.sflow.skip_vlan = false;
+            } else {
+                std::cerr << "Invalid skip_vlan value: " << skip_str << " (use true/false)\n";
+                return false;
+            }
         } else {
             std::cerr << "Unknown or incomplete option: " << argv[i] << "\n";
             return false;
         }
     }
+    
+    // Validate S-Flow config - only validate when sampling is actually enabled
+    if (cmd.sflow.sampling_rate > 0 && cmd.sflow.ethertypes.empty()) {
+        std::cerr << "S-Flow sampling rate specified but no EtherTypes provided\n";
+        return false;
+    }
+    // Note: Allow ethertypes with sampling_rate=0 since 0 means disabled anyway
+    
     return true;
 }
 
@@ -523,8 +741,8 @@ int main(int argc, char** argv) {
 
     std::cout << "Device A: " << devA << "\n";
     std::cout << "Device B: " << devB << "\n";
-    if (cmd.cpu_a >= 0) std::cout << "Pin A→B thread to CPU " << cmd.cpu_a << "\n";
-    if (cmd.cpu_b >= 0) std::cout << "Pin B→A thread to CPU " << cmd.cpu_b << "\n";
+    if (cmd.cpu_a >= 0) LOG(LogLevel::INFO, "Pin A→B thread to CPU %d", cmd.cpu_a);
+    if (cmd.cpu_b >= 0) LOG(LogLevel::INFO, "Pin B→A thread to CPU %d", cmd.cpu_b);
 
     // Trap Ctrl-C for graceful shutdown
     std::signal(SIGINT,  handle_signal);
@@ -577,39 +795,55 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::fprintf(stderr, "[summary] %s: %s, %s\n",
-                 devA, A_zerocopy ? "zerocopy" : "copy", A_skb ? "SKB" : "DRV");
-    std::fprintf(stderr, "[summary] %s: %s, %s\n",
-                 devB, B_zerocopy ? "zerocopy" : "copy", B_skb ? "SKB" : "DRV");
+    LOG(LogLevel::INFO, "[summary] %s: %s, %s", devA, A_zerocopy ? "zerocopy" : "copy", A_skb ? "SKB" : "DRV");
+    LOG(LogLevel::INFO, "[summary] %s: %s, %s", devB, B_zerocopy ? "zerocopy" : "copy", B_skb ? "SKB" : "DRV");
 
     // --- Prefill fill rings & build TX freelists ---
     // Fill gets (frame_count - TX_RESERVE) frames; remainder becomes TX freelist.
     uint32_t fillA = prefill_fill_ring_n(umemA, std::max(0u, umemA.frame_count - TX_RESERVE));
     init_free_frames_from_remaining(umemA);
-    std::cout << devA << ": prefilled " << fillA
-              << " frames, TX free " << umemA.free_frames.size() << "\n";
+    LOG(LogLevel::INFO, "%s: prefilled %u frames, TX free %zu", devA, fillA, umemA.free_frames.size());
 
     uint32_t fillB = prefill_fill_ring_n(umemB, std::max(0u, umemB.frame_count - TX_RESERVE));
     init_free_frames_from_remaining(umemB);
-    std::cout << devB << ": prefilled " << fillB
-              << " frames, TX free " << umemB.free_frames.size() << "\n";
+    LOG(LogLevel::INFO, "%s: prefilled %u frames, TX free %zu", devB, fillB, umemB.free_frames.size());
 
-    std::cout << "Sockets created and rings mapped. Starting bidirectional forwarding (multi-threaded)...\n";
+    // --- S-Flow configuration logging ---
+    if (cmd.sflow.is_enabled()) {
+        LOG(LogLevel::INFO, "S-Flow sampling enabled for A→B traffic:");
+        LOG(LogLevel::INFO, "  - Sampling rate: 1 in %u packets", cmd.sflow.sampling_rate);
+        LOG(LogLevel::INFO, "  - Skip VLAN tags: %s", cmd.sflow.skip_vlan ? "true" : "false");
+        std::stringstream ss;
+        for (size_t i = 0; i < cmd.sflow.ethertypes.size(); ++i) {
+            if (i > 0) ss << ", ";
+            ss << "0x" << std::hex << std::uppercase << cmd.sflow.ethertypes[i];
+        }
+        LOG(LogLevel::INFO, "  - EtherTypes: %s", ss.str().c_str());
+    }
+    
+    LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional forwarding (multi-threaded)...");
 
+    // --- S-Flow state (only needed for A→B direction) ---
+    SFlowState sflow_state_ab {};
+    
     // --- Launch one worker thread per direction, with optional CPU pinning ---
     std::thread t_ab(
         forward_worker, "A→B",
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_a /* pin id or -1 */);
+        cmd.cpu_a, /* pin id or -1 */
+        cmd.sflow.is_enabled() ? &cmd.sflow : nullptr,
+        cmd.sflow.is_enabled() ? &sflow_state_ab : nullptr);
 
     std::thread t_ba(
         forward_worker, "B→A",
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_b /* pin id or -1 */);
+        cmd.cpu_b, /* pin id or -1 */
+        nullptr, /* no S-Flow for B→A */
+        nullptr);
 
     // Wait for Ctrl-C
     t_ab.join();
