@@ -16,6 +16,13 @@
 #include <sys/socket.h>   // sendto
 #include <cstdio>         // perror, fprintf
 #include <arpa/inet.h>    // ntohs
+#include <linux/net_tstamp.h> // timestamping constants
+#include <linux/sockios.h>    // socket ioctls
+#include <sys/uio.h>          // iovec for recvmsg
+#include <linux/errqueue.h>   // sock_extended_err
+#include <linux/ptp_clock.h>  // PTP clock interface
+#include <sys/ioctl.h>        // ioctl
+#include <fcntl.h>            // open, O_RDONLY
 
 #include <pthread.h>
 #include <sched.h>
@@ -162,6 +169,93 @@ static inline bool parse_ethertype_vlan_aware(const uint8_t* frame, uint32_t len
 }
 
 // -----------------------------------------------------------------------------
+// Hardware timestamp extraction
+// -----------------------------------------------------------------------------
+// Try to get PTP hardware clock timestamp directly
+static bool get_ptp_hw_timestamp(uint64_t& timestamp_ns) {
+    static int ptp_fd = -1;
+    static bool ptp_init_attempted = false;
+    
+    // Initialize PTP clock file descriptor once
+    if (!ptp_init_attempted) {
+        ptp_init_attempted = true;
+        ptp_fd = open("/dev/ptp0", O_RDONLY);
+        if (ptp_fd < 0) {
+            LOG(LogLevel::DEBUG, "Failed to open /dev/ptp0: %s", strerror(errno));
+            return false;
+        }
+        LOG(LogLevel::INFO, "PTP hardware clock /dev/ptp0 opened successfully");
+    }
+    
+    if (ptp_fd < 0) return false;
+    
+    struct ptp_sys_offset_precise pso = {};
+    if (ioctl(ptp_fd, PTP_SYS_OFFSET_PRECISE, &pso) == 0) {
+        // Use PTP hardware timestamp
+        timestamp_ns = (uint64_t)pso.device.sec * 1000000000ULL + (uint64_t)pso.device.nsec;
+        return true;
+    }
+    
+    // Fallback to basic PTP clock read
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        return true;
+    }
+    
+    return false;
+}
+
+static bool extract_hw_timestamp(int sockfd, uint64_t& timestamp_ns) {
+    // Try to get hardware timestamp from socket error queue
+    char control[256];
+    char data[1];
+    struct iovec iov = { data, sizeof(data) };
+    struct msghdr msg = {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    
+    // Check for available timestamp on error queue (non-blocking)
+    ssize_t ret = recvmsg(sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+    if (ret < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Only log if it's not just "no data available"
+            LOG(LogLevel::DEBUG, "recvmsg MSG_ERRQUEUE failed: %s", strerror(errno));
+        }
+        return false;
+    }
+    
+    // Parse control messages for timestamp
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET) {
+            if (cmsg->cmsg_type == SCM_TIMESTAMPING) {
+                // Extract hardware timestamp from control message
+                struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
+                // ts[0] = software timestamp, ts[1] = deprecated, ts[2] = hardware timestamp
+                if (ts[2].tv_sec != 0 || ts[2].tv_nsec != 0) {
+                    timestamp_ns = (uint64_t)ts[2].tv_sec * 1000000000ULL + (uint64_t)ts[2].tv_nsec;
+                    return true;
+                }
+                // Fallback to software timestamp if hardware not available
+                if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
+                    timestamp_ns = (uint64_t)ts[0].tv_sec * 1000000000ULL + (uint64_t)ts[0].tv_nsec;
+                    return true;
+                }
+            } else if (cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+                // Alternative nanosecond timestamp
+                struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
+                timestamp_ns = (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+// -----------------------------------------------------------------------------
 // S-Flow sampling configuration
 // -----------------------------------------------------------------------------
 struct SFlowConfig {
@@ -230,22 +324,33 @@ struct SFlowState {
 struct SFlowPacket {
     std::vector<uint8_t> data;
     uint32_t length;
+    uint64_t timestamp_ns; // 1588 hardware timestamp in nanoseconds
+    bool has_timestamp;
     
-    SFlowPacket(const uint8_t* frame, uint32_t len) : data(frame, frame + len), length(len) {}
+    SFlowPacket(const uint8_t* frame, uint32_t len, uint64_t ts_ns = 0, bool has_ts = false) 
+        : data(frame, frame + len), length(len), timestamp_ns(ts_ns), has_timestamp(has_ts) {}
 };
 
 static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
                                                         uint16_t ethertype, const SFlowConfig& config, 
-                                                        SFlowState& state) {
+                                                        SFlowState& state, uint64_t timestamp_ns = 0, bool has_timestamp = false, bool is_hw_timestamp = false) {
     state.sampled_count++;
-    LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) skip_vlan=%s",
-        tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
-        config.skip_vlan ? "true" : "false");
+    
+    if (has_timestamp) {
+        const char* ts_type = is_hw_timestamp ? "HW" : "SW";
+        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=%lu ns (%s) skip_vlan=%s",
+            tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
+            timestamp_ns, ts_type, config.skip_vlan ? "true" : "false");
+    } else {
+        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=none skip_vlan=%s",
+            tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
+            config.skip_vlan ? "true" : "false");
+    }
     
     // Create a copy of the packet to be sent after the original
     // You can modify this logic to conditionally return a packet or nullptr
     LOG(LogLevel::INFO, "[%s SFLOW] Creating packet copy for transmission", tag);
-    return std::make_unique<SFlowPacket>(frame, len);
+    return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
 }
 
 // -----------------------------------------------------------------------------
@@ -301,6 +406,24 @@ int setup_rings(const char* ifname,
         return 1;
     }
     ep.fd = xsk_socket__fd(ep.xsk);
+    
+    // Enable comprehensive timestamping for 1588 PTP support
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE | SOF_TIMESTAMPING_RX_SOFTWARE | 
+                SOF_TIMESTAMPING_RAW_HARDWARE | SOF_TIMESTAMPING_SOFTWARE |
+                SOF_TIMESTAMPING_TX_HARDWARE | SOF_TIMESTAMPING_TX_SOFTWARE;
+    if (setsockopt(ep.fd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags)) < 0) {
+        LOG(LogLevel::WARN, "[%s] Failed to enable hardware timestamping: %s (continuing without timestamps)",
+            ifname, strerror(errno));
+    } else {
+        LOG(LogLevel::INFO, "[%s] Hardware timestamping enabled (HW+SW RX/TX)", ifname);
+    }
+    
+    // Enable timestamp on all packets
+    int enable = 1;
+    if (setsockopt(ep.fd, SOL_SOCKET, SO_TIMESTAMP, &enable, sizeof(enable)) < 0) {
+        LOG(LogLevel::DEBUG, "[%s] SO_TIMESTAMP failed: %s", ifname, strerror(errno));
+    }
+    
     return 0;
 }
 
@@ -481,7 +604,30 @@ void forward_step(const char* tag,
                     // Check if this EtherType is in our sample list
                     for (uint16_t target_et : sflow_config->ethertypes) {
                         if (et == target_et) {
-                            auto sflow_pkt = process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state);
+                            // Try to extract hardware timestamp for 1588 support
+                            uint64_t timestamp_ns = 0;
+                            bool has_timestamp = false;
+                            bool is_hw_timestamp = false;
+                            
+                            // First try to get hardware timestamp from PTP hardware clock
+                            if (get_ptp_hw_timestamp(timestamp_ns)) {
+                                has_timestamp = true;
+                                is_hw_timestamp = true;
+                            } else if (extract_hw_timestamp(in_ep.fd, timestamp_ns)) {
+                                has_timestamp = true;
+                                is_hw_timestamp = true;
+                            } else {
+                                // Fallback to system time if hardware timestamp not available
+                                struct timespec ts;
+                                if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+                                    timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+                                    has_timestamp = true;
+                                    is_hw_timestamp = false;
+                                }
+                            }
+                            
+                            auto sflow_pkt = process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state,
+                                                                timestamp_ns, has_timestamp, is_hw_timestamp);
                             if (sflow_pkt) {
                                 sflow_packets.push_back(std::move(sflow_pkt));
                             }
@@ -564,7 +710,12 @@ void forward_step(const char* tag,
                     xsk_ring_prod__submit(&out_ep.tx, 1);
                     (void)sendto(out_ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0); // TX kick
                     
-                    LOG(LogLevel::DEBUG, "[%s] S-Flow packet sent: len=%u", tag, sflow_pkt->length);
+                    if (sflow_pkt->has_timestamp) {
+                        LOG(LogLevel::DEBUG, "[%s] S-Flow packet sent: len=%u timestamp=%lu ns", 
+                            tag, sflow_pkt->length, sflow_pkt->timestamp_ns);
+                    } else {
+                        LOG(LogLevel::DEBUG, "[%s] S-Flow packet sent: len=%u (no timestamp)", tag, sflow_pkt->length);
+                    }
                 } else {
                     LOG(LogLevel::WARN, "[%s] Failed to allocate frame for S-Flow packet", tag);
                     // Note: Cannot cancel reserved TX slot in libxdp, will be unused
