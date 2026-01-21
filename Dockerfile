@@ -12,13 +12,14 @@ RUN apt-get update && apt-get install -y \
     libxdp-dev \
     linux-headers-generic \
     linux-tools-generic \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY bitw_xdp.cpp .
+COPY bitw_common.h bitw_common.cpp bitw_sflow.cpp bitw_filter.cpp Makefile ./
 
-# Build the application
-RUN g++ -std=gnu++17 -Wall -O2 bitw_xdp.cpp -o bitw_xdp -lpthread -lxdp -lbpf
+# Build both applications
+RUN make clean && make
 
 # Runtime stage - use Ubuntu 24.04 for libxdp runtime packages
 FROM ubuntu:24.04 AS runtime
@@ -35,17 +36,37 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/bitw_xdp .
+# Copy binaries from builder
+COPY --from=builder /app/bitw_sflow .
+COPY --from=builder /app/bitw_filter .
 COPY Readme.md .
 
-RUN chmod +x bitw_xdp
+RUN chmod +x bitw_sflow bitw_filter
 
 # Create entrypoint script
 RUN echo '#!/bin/bash\n\
 set -e\n\
 \n\
-echo "🚀 bitw_xdp AF_XDP Packet Forwarder (Docker-only build)"\n\
+# Default program is sflow\n\
+PROGRAM="${BITW_MODE:-sflow}"\n\
+\n\
+case "$PROGRAM" in\n\
+    sflow)\n\
+        BINARY="./bitw_sflow"\n\
+        DESCRIPTION="S-Flow Packet Forwarder with TCP Watermarking"\n\
+        ;;\n\
+    filter)\n\
+        BINARY="./bitw_filter"\n\
+        DESCRIPTION="Watermark Packet Filter"\n\
+        ;;\n\
+    *)\n\
+        echo "❌ Error: Invalid BITW_MODE=$PROGRAM"\n\
+        echo "   Valid modes: sflow, filter"\n\
+        exit 1\n\
+        ;;\n\
+esac\n\
+\n\
+echo "🚀 $DESCRIPTION (Docker)"\n\
 echo "================================================"\n\
 \n\
 if [ "$EUID" -ne 0 ]; then\n\
@@ -55,17 +76,24 @@ if [ "$EUID" -ne 0 ]; then\n\
 fi\n\
 \n\
 if [ $# -lt 2 ]; then\n\
-    echo "Usage: docker run --privileged --network=host --rm <image> <netdev_A> <netdev_B> [options]"\n\
+    echo "Usage: docker run --privileged --network=host --rm [-e BITW_MODE=sflow|filter] <image> <netdev_A> <netdev_B> [options]"\n\
+    echo ""\n\
+    echo "Modes:"\n\
+    echo "  BITW_MODE=sflow   S-Flow sampling with TCP watermarking (default)"\n\
+    echo "  BITW_MODE=filter  Watermark detection and filtering"\n\
     echo ""\n\
     echo "Examples:"\n\
-    echo "  sudo docker run --privileged --network=host --rm <image> eth0 eth1"\n\
+    echo "  # S-Flow mode (default)"\n\
+    echo "  sudo docker run --privileged --network=host --rm <image> eth0 eth1 --sample.sampling 1000 --sample.ethertypes=0x800"\n\
+    echo "  # Filter mode"\n\
+    echo "  sudo docker run --privileged --network=host --rm -e BITW_MODE=filter <image> eth0 eth1"\n\
+    echo "  # CPU pinning"\n\
     echo "  sudo docker run --privileged --network=host --rm <image> eth0 eth1 --cpu-a 2 --cpu-b 4"\n\
-    echo "  sudo docker run --privileged --network=host --rm -e BUMP_VERBOSE=1 <image> eth0 eth1"\n\
     echo ""\n\
     echo "Available interfaces:"\n\
     ip -o link show | awk -F": " "{print \\"  \\", \\$2}" | grep -v lo || echo "  (run with --network=host to see interfaces)"\n\
     echo ""\n\
-    ./bitw_xdp 2>&1 || true\n\
+    $BINARY 2>&1 || true\n\
     exit 1\n\
 fi\n\
 \n\
@@ -73,10 +101,10 @@ echo "🔧 Configuring interfaces..."\n\
 ip link set dev "$1" promisc on || echo "⚠️  Warning: Failed to set $1 promiscuous mode"\n\
 ip link set dev "$2" promisc on || echo "⚠️  Warning: Failed to set $2 promiscuous mode"\n\
 \n\
-echo "🌐 Starting bidirectional forwarding: $1 ↔ $2"\n\
+echo "🌐 Starting $DESCRIPTION: $1 ↔ $2"\n\
 echo "Press Ctrl+C to stop gracefully"\n\
 echo "================================================"\n\
-exec ./bitw_xdp "$@"' > /app/entrypoint.sh
+exec $BINARY "$@"' > /app/entrypoint.sh
 
 RUN chmod +x /app/entrypoint.sh
 

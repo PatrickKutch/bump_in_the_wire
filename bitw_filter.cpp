@@ -32,6 +32,9 @@ static bool is_watermarked_packet(const PacketLayers& layers) {
     uint64_t extracted_timestamp = be64toh(timestamp_be);
     
     // Basic sanity checks on extracted values
+    // Hash should not be zero (indicates valid packet data)
+    if (extracted_hash == 0) return false;
+    
     // Timestamp should be reasonable (not zero, not too far in future)
     uint64_t current_ns = 0;
     struct timespec ts;
@@ -54,8 +57,7 @@ static bool is_watermarked_packet(const PacketLayers& layers) {
 }
 
 // Process a detected watermarked packet
-static void process_watermarked_packet(const char* tag, const PacketLayers& layers, 
-                                     const uint8_t* frame, uint32_t len) {
+static void process_watermarked_packet(const char* tag, const PacketLayers& layers, uint32_t len) {
     // Extract watermark data
     uint64_t hash_be, timestamp_be;
     std::memcpy(&hash_be, layers.l4_payload, 8);
@@ -142,7 +144,7 @@ void filter_step(const char* tag,
                 dropped_packets++;
                 forward_packet[i] = false; // Drop watermarked packet
                 
-                process_watermarked_packet(tag, layers, frame, rx_lens[i]);
+                process_watermarked_packet(tag, layers, rx_lens[i]);
             }
             
             // Debug: log EtherType per packet

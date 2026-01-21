@@ -12,7 +12,7 @@ static inline uint64_t calculate_packet_hash(const uint8_t* data, uint32_t len) 
 }
 
 // Check if a packet is TCP by examining the IP protocol field
-static inline bool is_tcp_packet(const uint8_t* frame, uint32_t len, uint16_t ethertype) {
+static inline bool is_tcp_packet(const uint8_t* frame, uint32_t len) {
     PacketLayers layers = parse_packet_layers(frame, len, 6); // 6 = TCP protocol
     return layers.valid && layers.l4_protocol == 6;
 }
@@ -99,7 +99,7 @@ static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const 
     
     // Create a copy of the packet to be sent after the original
     // Check if this is a TCP packet and handle it specially
-    if (is_tcp_packet(frame, len, ethertype)) {
+    if (is_tcp_packet(frame, len)) {
         LOG(LogLevel::INFO, "[%s SFLOW] TCP packet detected, creating tagged copy", tag);
         return create_tagged_tcp_packet(frame, len, timestamp_ns, has_timestamp);
     } else {
