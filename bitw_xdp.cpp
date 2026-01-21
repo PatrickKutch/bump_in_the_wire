@@ -1,6 +1,7 @@
 // bump_mt_pin.cpp
 #include <iostream>
 #include <vector>
+#include <memory>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -225,16 +226,26 @@ struct SFlowState {
     uint32_t sampled_count = 0;
 };
 
-static void process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
-                                uint16_t ethertype, const SFlowConfig& config, 
-                                SFlowState& state) {
+// Structure to hold S-Flow packet data to be sent
+struct SFlowPacket {
+    std::vector<uint8_t> data;
+    uint32_t length;
+    
+    SFlowPacket(const uint8_t* frame, uint32_t len) : data(frame, frame + len), length(len) {}
+};
+
+static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
+                                                        uint16_t ethertype, const SFlowConfig& config, 
+                                                        SFlowState& state) {
     state.sampled_count++;
     LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) skip_vlan=%s",
         tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
         config.skip_vlan ? "true" : "false");
     
-    // Here you could add actual S-Flow record generation and export
-    // For now, we just log the sample
+    // Create a copy of the packet to be sent after the original
+    // You can modify this logic to conditionally return a packet or nullptr
+    LOG(LogLevel::INFO, "[%s SFLOW] Creating packet copy for transmission", tag);
+    return std::make_unique<SFlowPacket>(frame, len);
 }
 
 // -----------------------------------------------------------------------------
@@ -453,6 +464,7 @@ void forward_step(const char* tag,
     }
     
     // S-Flow sampling (only for A→B direction indicated by tag)
+    std::vector<std::unique_ptr<SFlowPacket>> sflow_packets;
     if (sflow_config && sflow_config->is_enabled() && sflow_state && 
         sflow_config->sampling_rate > 0 && 
         std::strcmp(tag, "A→B") == 0) {
@@ -469,7 +481,10 @@ void forward_step(const char* tag,
                     // Check if this EtherType is in our sample list
                     for (uint16_t target_et : sflow_config->ethertypes) {
                         if (et == target_et) {
-                            process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state);
+                            auto sflow_pkt = process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state);
+                            if (sflow_pkt) {
+                                sflow_packets.push_back(std::move(sflow_pkt));
+                            }
                             break; // Only sample once per packet even if multiple matches
                         }
                     }
@@ -522,6 +537,42 @@ void forward_step(const char* tag,
     if (actually_tx) {
         xsk_ring_prod__submit(&out_ep.tx, actually_tx);
         (void)sendto(out_ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0); // TX kick
+    }
+    
+    // 5.5) Send S-Flow packets if any were generated
+    if (!sflow_packets.empty()) {
+        LOG(LogLevel::DEBUG, "[%s] Sending %zu S-Flow packet copies", tag, sflow_packets.size());
+        
+        for (const auto& sflow_pkt : sflow_packets) {
+            // Try to reserve one more TX slot for the S-Flow packet
+            uint32_t sflow_tx_idx = 0;
+            unsigned int sflow_tx_space = xsk_ring_prod__reserve(&out_ep.tx, 1, &sflow_tx_idx);
+            
+            if (sflow_tx_space > 0) {
+                uint64_t sflow_out_addr = 0;
+                if (alloc_frame(out_umem, sflow_out_addr)) {
+                    // Copy S-Flow packet data to output UMEM
+                    uint8_t* sflow_dst = umem_ptr(out_umem, sflow_out_addr);
+                    std::memcpy(sflow_dst, sflow_pkt->data.data(), sflow_pkt->length);
+                    
+                    // Fill TX descriptor for S-Flow packet
+                    struct xdp_desc* sflow_txd = xsk_ring_prod__tx_desc(&out_ep.tx, sflow_tx_idx);
+                    sflow_txd->addr = sflow_out_addr;
+                    sflow_txd->len = sflow_pkt->length;
+                    
+                    // Submit S-Flow packet
+                    xsk_ring_prod__submit(&out_ep.tx, 1);
+                    (void)sendto(out_ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0); // TX kick
+                    
+                    LOG(LogLevel::DEBUG, "[%s] S-Flow packet sent: len=%u", tag, sflow_pkt->length);
+                } else {
+                    LOG(LogLevel::WARN, "[%s] Failed to allocate frame for S-Flow packet", tag);
+                    // Note: Cannot cancel reserved TX slot in libxdp, will be unused
+                }
+            } else {
+                LOG(LogLevel::WARN, "[%s] No TX space available for S-Flow packet", tag);
+            }
+        }
     }
 
     // 6) Release RX descriptors we consumed
