@@ -29,6 +29,8 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <random>
+#include <functional>
 
 #include <xdp/xsk.h>
 #include <linux/if_link.h> // XDP_FLAGS_*
@@ -331,6 +333,150 @@ struct SFlowPacket {
         : data(frame, frame + len), length(len), timestamp_ns(ts_ns), has_timestamp(has_ts) {}
 };
 
+// Calculate a simple hash of packet data
+static inline uint64_t calculate_packet_hash(const uint8_t* data, uint32_t len) {
+    std::hash<std::string> hasher;
+    std::string packet_str(reinterpret_cast<const char*>(data), len);
+    return static_cast<uint64_t>(hasher(packet_str));
+}
+
+// Check if a packet is TCP by examining the IP protocol field
+static inline bool is_tcp_packet(const uint8_t* frame, uint32_t len, uint16_t ethertype) {
+    if (ethertype == 0x0800) { // IPv4
+        if (len < 14 + 20) return false; // Ethernet + min IPv4 header
+        const uint8_t* ip_header = frame + 14;
+        uint8_t protocol = ip_header[9]; // Protocol field in IPv4 header
+        return protocol == 6; // TCP protocol number
+    } else if (ethertype == 0x86DD) { // IPv6
+        if (len < 14 + 40) return false; // Ethernet + IPv6 header
+        const uint8_t* ipv6_header = frame + 14;
+        uint8_t next_header = ipv6_header[6]; // Next Header field in IPv6 header
+        return next_header == 6; // TCP protocol number
+    }
+    return false;
+}
+
+// Create a tagged TCP packet copy for S-Flow processing
+static std::unique_ptr<SFlowPacket> create_tagged_tcp_packet(const uint8_t* frame, uint32_t len, 
+                                                           uint64_t timestamp_ns, bool has_timestamp) {
+    // Calculate hash of original packet
+    uint64_t packet_hash = calculate_packet_hash(frame, len);
+    
+    // Create new payload: [hash:8][timestamp:8] = 16 bytes
+    const uint32_t new_payload_size = 16;
+    std::vector<uint8_t> new_payload(new_payload_size);
+    
+    // Pack hash and timestamp in network byte order
+    uint64_t hash_be = htobe64(packet_hash);
+    uint64_t timestamp_be = htobe64(timestamp_ns);
+    std::memcpy(new_payload.data(), &hash_be, 8);
+    std::memcpy(new_payload.data() + 8, &timestamp_be, 8);
+    
+    // Parse original packet to find header boundaries
+    if (len >= 14) { // Minimum Ethernet header size
+        uint16_t ethertype = 0;
+        if (parse_ethertype_vlan_aware(frame, len, ethertype)) {
+            uint32_t ip_header_start = 14; // Start after Ethernet header
+            
+            // Handle VLAN tags - adjust IP header start position
+            const uint8_t* eth_type_ptr = frame + 12;
+            uint16_t et;
+            read_be16(eth_type_ptr, et);
+            while ((et == 0x8100 || et == 0x88A8 || et == 0x9100) && ip_header_start + 4 <= len) {
+                ip_header_start += 4; // Skip VLAN tag
+                eth_type_ptr += 4;
+                if (ip_header_start + 2 <= len) {
+                    read_be16(eth_type_ptr, et);
+                } else {
+                    break;
+                }
+            }
+            
+            if (ethertype == 0x0800 && len >= ip_header_start + 20) { // IPv4
+                const uint8_t* ip_header = frame + ip_header_start;
+                uint8_t ihl = (ip_header[0] & 0x0F) * 4; // IP Header Length in bytes
+                uint32_t tcp_header_start = ip_header_start + ihl;
+                uint32_t tcp_header_size = 20; // Minimum TCP header size
+                
+                if (len >= tcp_header_start + tcp_header_size) {
+                    // Calculate new packet size: headers + new payload
+                    uint32_t new_packet_size = tcp_header_start + tcp_header_size + new_payload_size;
+                    std::vector<uint8_t> modified_frame(new_packet_size);
+                    
+                    // Copy headers (Ethernet + IP + TCP)
+                    std::memcpy(modified_frame.data(), frame, tcp_header_start + tcp_header_size);
+                    
+                    // Append new payload
+                    std::memcpy(modified_frame.data() + tcp_header_start + tcp_header_size, 
+                               new_payload.data(), new_payload_size);
+                    
+                    // Update IP total length field
+                    uint16_t ip_total_len = ihl + tcp_header_size + new_payload_size;
+                    uint16_t ip_total_len_be = htons(ip_total_len);
+                    std::memcpy(modified_frame.data() + ip_header_start + 2, &ip_total_len_be, 2);
+                    
+                    // Set TCP Reserved bits with random tag
+                    uint32_t reserved_byte_offset = tcp_header_start + 12;
+                    static thread_local std::random_device rd;
+                    static thread_local std::mt19937 gen(rd());
+                    static thread_local std::uniform_int_distribution<> dis(1, 15);
+                    uint8_t random_tag = static_cast<uint8_t>(dis(gen));
+                    
+                    uint8_t tcp_flags_byte = modified_frame[reserved_byte_offset];
+                    tcp_flags_byte = (tcp_flags_byte & 0x0F) | (random_tag << 4);
+                    modified_frame[reserved_byte_offset] = tcp_flags_byte;
+                    
+                    LOG(LogLevel::DEBUG, "Tagged TCP packet: hash=0x%016lX timestamp=%lu payload_size=%u reserved_bits=0x%02X",
+                        packet_hash, timestamp_ns, new_payload_size, random_tag);
+                    
+                    return std::make_unique<SFlowPacket>(modified_frame.data(), new_packet_size, timestamp_ns, has_timestamp);
+                }
+            } else if (ethertype == 0x86DD && len >= ip_header_start + 40) { // IPv6
+                uint32_t tcp_header_start = ip_header_start + 40; // IPv6 header is fixed 40 bytes
+                uint32_t tcp_header_size = 20; // Minimum TCP header size
+                
+                if (len >= tcp_header_start + tcp_header_size) {
+                    // Calculate new packet size: headers + new payload
+                    uint32_t new_packet_size = tcp_header_start + tcp_header_size + new_payload_size;
+                    std::vector<uint8_t> modified_frame(new_packet_size);
+                    
+                    // Copy headers (Ethernet + IPv6 + TCP)
+                    std::memcpy(modified_frame.data(), frame, tcp_header_start + tcp_header_size);
+                    
+                    // Append new payload
+                    std::memcpy(modified_frame.data() + tcp_header_start + tcp_header_size,
+                               new_payload.data(), new_payload_size);
+                    
+                    // Update IPv6 payload length field
+                    uint16_t ipv6_payload_len = tcp_header_size + new_payload_size;
+                    uint16_t ipv6_payload_len_be = htons(ipv6_payload_len);
+                    std::memcpy(modified_frame.data() + ip_header_start + 4, &ipv6_payload_len_be, 2);
+                    
+                    // Set TCP Reserved bits with random tag
+                    uint32_t reserved_byte_offset = tcp_header_start + 12;
+                    static thread_local std::random_device rd;
+                    static thread_local std::mt19937 gen(rd());
+                    static thread_local std::uniform_int_distribution<> dis(1, 15);
+                    uint8_t random_tag = static_cast<uint8_t>(dis(gen));
+                    
+                    uint8_t tcp_flags_byte = modified_frame[reserved_byte_offset];
+                    tcp_flags_byte = (tcp_flags_byte & 0x0F) | (random_tag << 4);
+                    modified_frame[reserved_byte_offset] = tcp_flags_byte;
+                    
+                    LOG(LogLevel::DEBUG, "Tagged IPv6 TCP packet: hash=0x%016lX timestamp=%lu payload_size=%u reserved_bits=0x%02X",
+                        packet_hash, timestamp_ns, new_payload_size, random_tag);
+                    
+                    return std::make_unique<SFlowPacket>(modified_frame.data(), new_packet_size, timestamp_ns, has_timestamp);
+                }
+            }
+        }
+    }
+    
+    // Fallback: return original packet if parsing fails
+    LOG(LogLevel::WARN, "Failed to parse TCP packet for tagging, returning original");
+    return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
+}
+
 static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
                                                         uint16_t ethertype, const SFlowConfig& config, 
                                                         SFlowState& state, uint64_t timestamp_ns = 0, bool has_timestamp = false, bool is_hw_timestamp = false) {
@@ -348,9 +494,16 @@ static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const 
     }
     
     // Create a copy of the packet to be sent after the original
-    // You can modify this logic to conditionally return a packet or nullptr
-    LOG(LogLevel::INFO, "[%s SFLOW] Creating packet copy for transmission", tag);
-    return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
+    // Check if this is a TCP packet and handle it specially
+    if (is_tcp_packet(frame, len, ethertype)) {
+        LOG(LogLevel::INFO, "[%s SFLOW] TCP packet detected, creating tagged copy", tag);
+        return create_tagged_tcp_packet(frame, len, timestamp_ns, has_timestamp);
+    } else {
+        // For non-TCP packets, create a standard copy
+        // LOG(LogLevel::INFO, "[%s SFLOW] Creating packet copy for transmission", tag);
+        // return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
+        return nullptr;
+    }
 }
 
 // -----------------------------------------------------------------------------
