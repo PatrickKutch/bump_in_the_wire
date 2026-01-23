@@ -17,9 +17,28 @@ bitw_xdp
 
 ## 🛠️ Build Instructions
 
+### Local Build
 ```bash
 g++ -std=gnu++17 -Wall -O2 bitw_xdp.cpp -o bitw_xdp -lpthread -lxdp -lbpf
 ```
+
+### Container Build
+
+Build the containerized version using the provided helper script:
+```bash
+./build-docker-only.sh
+```
+
+Or build manually with Docker/Podman:
+```bash
+# Using Docker
+docker build -t bitw_xdp:docker-only .
+
+# Using Podman  
+podman build -t bitw_xdp:docker-only .
+```
+
+The container includes both `bitw_sflow` and `bitw_filter` applications and uses Ubuntu 24.04 as the base image with libxdp packages.
 
 ### Ensure you have the following installed:
 
@@ -62,6 +81,93 @@ This will:
 ### Environment Variable
 BUMP_VERBOSE=1
 - Enables per-packet debug output, including EtherType and length.
+
+## 🐳 Containerized Usage
+
+### Prerequisites for Container Execution
+- **Root privileges required** - AF_XDP requires privileged access to network interfaces
+- **Host networking** - Container must run with `--network=host` to access physical interfaces
+- **Required volume mounts**:
+  - `/sys/fs/bpf:/sys/fs/bpf` - BPF filesystem access for XDP programs
+  - `/sys:/sys` - System information access
+  - `/proc:/proc` - Process information access
+
+### Using the Helper Script (Recommended)
+
+The `run-container.sh` script simplifies container execution:
+
+```bash
+# S-Flow sampling (default mode)
+sudo ./run-container.sh PF0 PF1
+sudo ./run-container.sh --mode sflow PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800
+
+# Watermark filtering
+sudo ./run-container.sh --mode filter eth0 eth1 --cpu-a 4 --cpu-b 8
+
+# With verbose debugging
+sudo BUMP_VERBOSE=1 ./run-container.sh eth0 eth1
+```
+
+### Direct Docker Commands
+
+**S-Flow Sampling (bitw_sflow):**
+```bash
+# Basic S-Flow forwarding
+sudo docker run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    bitw_xdp:docker-only eth0 eth1
+
+# With sampling configuration
+sudo docker run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    bitw_xdp:docker-only PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800,0x86DD --sample.skip_vlan=true
+
+# With CPU pinning
+sudo docker run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    bitw_xdp:docker-only eth0 eth1 --cpu-a 4 --cpu-b 8
+```
+
+**Watermark Filtering (bitw_filter):**
+```bash
+sudo docker run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    -e BITW_MODE=filter \
+    bitw_xdp:docker-only eth0 eth1 --cpu-a 4 --cpu-b 8
+```
+
+### Direct Podman Commands
+
+Podman commands are identical to Docker, just replace `docker` with `podman`:
+
+```bash
+# S-Flow sampling
+sudo podman run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    bitw_xdp:docker-only PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800
+
+# Watermark filtering
+sudo podman run --privileged --network=host --rm \
+    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
+    -e BITW_MODE=filter \
+    bitw_xdp:docker-only eth0 eth1
+```
+
+### Container Environment Variables
+
+- `BITW_MODE=sflow` (default) - Run S-Flow sampling application
+- `BITW_MODE=filter` - Run watermark filtering application  
+- `BUMP_VERBOSE=1` - Enable verbose packet debugging
+
+### Container Logs
+
+View container logs in real-time:
+```bash
+# If running with --rm, logs appear directly in terminal
+# For detached containers:
+sudo docker logs -f <container_name>
+sudo podman logs -f <container_name>
+```
 
 
 
