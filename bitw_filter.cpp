@@ -4,7 +4,7 @@
 // Watermark detection and filtering functions
 // -----------------------------------------------------------------------------
 
-// Check if a TCP packet is watermarked by examining Reserved bits and payload
+// Check if a TCP packet is watermarked by examining Reserved bits
 static bool is_watermarked_tcp_packet(const PacketLayers& layers) {
     // Check TCP Reserved bits (upper 4 bits of byte 12 in TCP header)
     uint32_t reserved_byte_offset = 12; // Relative to TCP header start
@@ -13,43 +13,8 @@ static bool is_watermarked_tcp_packet(const PacketLayers& layers) {
     uint8_t tcp_flags_byte = layers.l4_header[reserved_byte_offset];
     uint8_t reserved_bits = (tcp_flags_byte >> 4) & 0x0F;
     
-    // Check if Reserved bits are non-zero (our watermark)
-    if (reserved_bits == 0) return false;
-    
-    // Check if payload matches our watermark format: [hash:8][timestamp:8] = 16 bytes
-    if (layers.l4_payload_len != 16) return false;
-    
-    // Extract hash and timestamp from payload
-    uint64_t hash_be, timestamp_be;
-    std::memcpy(&hash_be, layers.l4_payload, 8);
-    std::memcpy(&timestamp_be, layers.l4_payload + 8, 8);
-    
-    uint64_t extracted_hash = be64toh(hash_be);
-    uint64_t extracted_timestamp = be64toh(timestamp_be);
-    
-    // Basic sanity checks on extracted values
-    // Hash should not be zero (indicates valid packet data)
-    if (extracted_hash == 0) return false;
-    
-    // Timestamp should be reasonable (not zero, not too far in future)
-    uint64_t current_ns = 0;
-    struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-        current_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-    }
-    
-    // Allow timestamps from up to 1 hour ago to 1 minute in future
-    uint64_t hour_ns = 3600ULL * 1000000000ULL;
-    uint64_t minute_ns = 60ULL * 1000000000ULL;
-    
-    if (extracted_timestamp == 0 || 
-        (current_ns > 0 && 
-         (extracted_timestamp < (current_ns - hour_ns) || 
-          extracted_timestamp > (current_ns + minute_ns)))) {
-        return false;
-    }
-    
-    return true; // TCP packet appears to be watermarked
+    // Simply check if Reserved bits are non-zero (our watermark indicator)
+    return (reserved_bits != 0);
 }
 
 // Check if a UDP packet is watermarked (future implementation)
@@ -119,7 +84,8 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
 void filter_step(const char* tag,
                  XskEndpoint& in_ep, UmemArea& in_umem,
                  XskEndpoint& out_ep, UmemArea& out_umem,
-                 bool debug_print = false)
+                 bool debug_print = false,
+                 const std::vector<uint16_t>& watermark_ethertypes = {})
 {
     static constexpr uint32_t BATCH = 64;
     static uint32_t total_packets = 0;
@@ -164,14 +130,32 @@ void filter_step(const char* tag,
             const uint8_t* frame = umem_ptr(in_umem, rx_addrs[i]);
             total_packets++;
             
+            bool should_check_watermark = true;
+            
+            // If EtherTypes are specified, only check packets matching those types
+            if (!watermark_ethertypes.empty()) {
+                should_check_watermark = false;
+                uint16_t et = 0;
+                if (get_ethertype(frame, rx_lens[i], et, false)) { // Use skip_vlan=false as default
+                    for (uint16_t target_et : watermark_ethertypes) {
+                        if (et == target_et) {
+                            should_check_watermark = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
             // Parse packet to check for watermark
-            PacketLayers layers = parse_packet_layers(frame, rx_lens[i]);
-            if (layers.valid && is_watermarked_packet(layers)) {
-                watermarked_packets++;
-                dropped_packets++;
-                forward_packet[i] = false; // Drop watermarked packet
-                
-                process_watermarked_packet(tag, layers, rx_lens[i]);
+            if (should_check_watermark) {
+                PacketLayers layers = parse_packet_layers(frame, rx_lens[i]);
+                if (layers.valid && is_watermarked_packet(layers)) {
+                    watermarked_packets++;
+                    dropped_packets++;
+                    forward_packet[i] = false; // Drop watermarked packet
+                    
+                    process_watermarked_packet(tag, layers, rx_lens[i]);
+                }
             }
             
             // Debug: log EtherType per packet
@@ -269,7 +253,8 @@ void filter_worker(const char* tag,
                    XskEndpoint* out_ep, UmemArea* out_umem,
                    std::atomic<bool>* running,
                    bool debug_print,
-                   int cpu_pin)
+                   int cpu_pin,
+                   const std::vector<uint16_t>& watermark_ethertypes)
 {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
@@ -288,7 +273,7 @@ void filter_worker(const char* tag,
             perror("poll");
             break;
         }
-        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print);
+        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_ethertypes);
     }
 }
 
@@ -300,6 +285,7 @@ struct FilterCmd {
     const char* devB = nullptr;
     int cpu_a = -1;
     int cpu_b = -1;
+    std::vector<uint16_t> watermark_ethertypes;
 };
 
 static void print_usage(const char* prog) {
@@ -310,11 +296,15 @@ static void print_usage(const char* prog) {
         << "\nCPU Pinning:\n"
         << "  --cpu-a N               Pin A→B worker thread to CPU N\n"
         << "  --cpu-b M               Pin B→A worker thread to CPU M\n"
+        << "\nWatermark Filtering:\n"
+        << "  --watermark.ethertypes L  Comma-separated EtherTypes to check for watermarks (e.g. 0x800,0x86DD)\n"
+        << "                            If not specified, checks all packets\n"
         << "\nEnvironment:\n"
         << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + action)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1\n"
         << "  " << prog << " PF0 PF1 --cpu-a 2 --cpu-b 3\n"
+        << "  " << prog << " PF0 PF1 --watermark.ethertypes=0x800,0x86DD\n"
         << "\nWatermark Detection:\n"
         << "  - Looks for TCP packets with non-zero Reserved bits\n"
         << "  - Expects 16-byte payload containing [hash:8][timestamp:8]\n"
@@ -351,6 +341,17 @@ static bool parse_args(int argc, char** argv, FilterCmd& cmd) {
                 cmd.cpu_b = std::atoi(argv[++i]);
             } else {
                 std::cerr << "Missing value for --cpu-b\n";
+                return false;
+            }
+        } else if (option == "--watermark.ethertypes") {
+            std::string types_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (types_str.empty()) {
+                std::cerr << "Missing value for --watermark.ethertypes\n";
+                return false;
+            }
+            if (!parse_ethertypes(types_str.c_str(), cmd.watermark_ethertypes)) {
+                std::cerr << "Failed to parse EtherTypes\n";
                 return false;
             }
         } else {
@@ -455,14 +456,14 @@ int main(int argc, char** argv) {
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_a);
+        cmd.cpu_a, cmd.watermark_ethertypes);
 
     std::thread t_ba(
         filter_worker, "B→A",
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_b);
+        cmd.cpu_b, cmd.watermark_ethertypes);
 
     // Wait for Ctrl-C
     t_ab.join();
