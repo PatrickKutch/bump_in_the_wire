@@ -4,12 +4,8 @@
 // Watermark detection and filtering functions
 // -----------------------------------------------------------------------------
 
-// Check if a packet is watermarked by examining TCP Reserved bits and payload
-static bool is_watermarked_packet(const PacketLayers& layers) {
-    if (!layers.valid || layers.l4_protocol != 6) { // Only TCP packets can be watermarked
-        return false;
-    }
-    
+// Check if a TCP packet is watermarked by examining Reserved bits and payload
+static bool is_watermarked_tcp_packet(const PacketLayers& layers) {
     // Check TCP Reserved bits (upper 4 bits of byte 12 in TCP header)
     uint32_t reserved_byte_offset = 12; // Relative to TCP header start
     if (layers.l4_header_len < 13) return false; // Need at least 13 bytes for flags byte
@@ -53,7 +49,38 @@ static bool is_watermarked_packet(const PacketLayers& layers) {
         return false;
     }
     
-    return true; // Packet appears to be watermarked
+    return true; // TCP packet appears to be watermarked
+}
+
+// Check if a UDP packet is watermarked (future implementation)
+static bool is_watermarked_udp_packet(const PacketLayers& layers) {
+    // TODO: Implement UDP watermark detection
+    // UDP doesn't have Reserved bits like TCP, so we'd need a different approach
+    // Possibilities:
+    // - Magic bytes at start/end of payload
+    // - Specific UDP port ranges
+    // - Payload length patterns
+    // - Checksum modifications
+    return false;
+}
+
+// Main watermark detection dispatcher - calls appropriate protocol handler
+static bool is_watermarked_packet(const PacketLayers& layers) {
+    if (!layers.valid) {
+        return false;
+    }
+    
+    switch (layers.l4_protocol) {
+        case 6:  // TCP
+            return is_watermarked_tcp_packet(layers);
+        case 17: // UDP
+            return is_watermarked_udp_packet(layers);
+        // Add other protocols as needed:
+        // case 1:  // ICMP
+        // case 58: // ICMPv6
+        default:
+            return false; // Unknown/unsupported protocol
+    }
 }
 
 // Process a detected watermarked packet
@@ -138,7 +165,7 @@ void filter_step(const char* tag,
             total_packets++;
             
             // Parse packet to check for watermark
-            PacketLayers layers = parse_packet_layers(frame, rx_lens[i], 6); // TCP only
+            PacketLayers layers = parse_packet_layers(frame, rx_lens[i]);
             if (layers.valid && is_watermarked_packet(layers)) {
                 watermarked_packets++;
                 dropped_packets++;

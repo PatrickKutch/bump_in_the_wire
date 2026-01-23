@@ -4,11 +4,58 @@
 // S-Flow specific functions
 // -----------------------------------------------------------------------------
 
-// Calculate a simple hash of packet data
+// Calculate hash of IP payload (TCP/UDP/etc.) excluding checksums
 static inline uint64_t calculate_packet_hash(const uint8_t* data, uint32_t len) {
+    // Parse packet to get IP payload
+    PacketLayers layers = parse_packet_layers(data, len);
+    if (!layers.valid || layers.l4_payload_len == 0) {
+        // Fallback to full packet hash if parsing fails
+        std::hash<std::string> hasher;
+        std::string packet_str(reinterpret_cast<const char*>(data), len);
+        return static_cast<uint64_t>(hasher(packet_str));
+    }
+    
+    // For TCP/UDP, we want to hash the L4 header + payload but exclude checksums
+    std::vector<uint8_t> hash_data;
+    
+    if (layers.l4_protocol == 6) { // TCP
+        // TCP header is at layers.l4_header, checksum is at bytes 16-17
+        if (layers.l4_header_len >= 18) {
+            // Copy TCP header excluding checksum (bytes 16-17)
+            hash_data.insert(hash_data.end(), layers.l4_header, layers.l4_header + 16);
+            if (layers.l4_header_len > 18) {
+                hash_data.insert(hash_data.end(), layers.l4_header + 18, layers.l4_header + layers.l4_header_len);
+            }
+        }
+        // Add TCP payload
+        if (layers.l4_payload_len > 0) {
+            hash_data.insert(hash_data.end(), layers.l4_payload, layers.l4_payload + layers.l4_payload_len);
+        }
+    } else if (layers.l4_protocol == 17) { // UDP
+        // UDP header is at layers.l4_header, checksum is at bytes 6-7
+        if (layers.l4_header_len >= 8) {
+            // Copy UDP header excluding checksum (bytes 6-7)
+            hash_data.insert(hash_data.end(), layers.l4_header, layers.l4_header + 6);
+            // Skip checksum bytes 6-7, but UDP header is only 8 bytes total
+        }
+        // Add UDP payload
+        if (layers.l4_payload_len > 0) {
+            hash_data.insert(hash_data.end(), layers.l4_payload, layers.l4_payload + layers.l4_payload_len);
+        }
+    } else {
+        // For other protocols, hash L4 header + payload as-is
+        if (layers.l4_header_len > 0) {
+            hash_data.insert(hash_data.end(), layers.l4_header, layers.l4_header + layers.l4_header_len);
+        }
+        if (layers.l4_payload_len > 0) {
+            hash_data.insert(hash_data.end(), layers.l4_payload, layers.l4_payload + layers.l4_payload_len);
+        }
+    }
+    
+    // Calculate hash
     std::hash<std::string> hasher;
-    std::string packet_str(reinterpret_cast<const char*>(data), len);
-    return static_cast<uint64_t>(hasher(packet_str));
+    std::string hash_str(reinterpret_cast<const char*>(hash_data.data()), hash_data.size());
+    return static_cast<uint64_t>(hasher(hash_str));
 }
 
 // Check if a packet is TCP by examining the IP protocol field
