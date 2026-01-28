@@ -72,12 +72,12 @@ static bool is_watermarked_packet(const uint8_t* frame, uint32_t len, const Pack
 // Process a detected watermarked packet
 static void process_watermarked_packet(const char* tag, const PacketLayers& layers, uint32_t len, int sockfd) {
     // Debug: Show raw payload bytes
-    LOG(LogLevel::DEBUG, "Raw payload (%u bytes): %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X %02X %02X %02X %02X",
-        layers.l4_payload_len,
-        layers.l4_payload[0], layers.l4_payload[1], layers.l4_payload[2], layers.l4_payload[3],
-        layers.l4_payload[4], layers.l4_payload[5], layers.l4_payload[6], layers.l4_payload[7],
-        layers.l4_payload[8], layers.l4_payload[9], layers.l4_payload[10], layers.l4_payload[11],
-        layers.l4_payload[12], layers.l4_payload[13], layers.l4_payload[14], layers.l4_payload[15]);
+    // LOG(LogLevel::DEBUG, "Raw payload (%u bytes): %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X %02X %02X %02X %02X",
+    //     layers.l4_payload_len,
+    //     layers.l4_payload[0], layers.l4_payload[1], layers.l4_payload[2], layers.l4_payload[3],
+    //     layers.l4_payload[4], layers.l4_payload[5], layers.l4_payload[6], layers.l4_payload[7],
+    //     layers.l4_payload[8], layers.l4_payload[9], layers.l4_payload[10], layers.l4_payload[11],
+    //     layers.l4_payload[12], layers.l4_payload[13], layers.l4_payload[14], layers.l4_payload[15]);
     
     // Extract watermark data
     uint64_t hash_be, timestamp_be;
@@ -87,8 +87,8 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
     uint64_t extracted_hash = be64toh(hash_be);
     uint64_t extracted_timestamp = be64toh(timestamp_be);
     
-    LOG(LogLevel::DEBUG, "Extracted BE values: hash_be=0x%016lX timestamp_be=0x%016lX", hash_be, timestamp_be);
-    LOG(LogLevel::DEBUG, "Converted LE values: hash=0x%016lX timestamp=%lu", extracted_hash, extracted_timestamp);
+    // LOG(LogLevel::DEBUG, "Extracted BE values: hash_be=0x%016lX timestamp_be=0x%016lX", hash_be, timestamp_be);
+    // LOG(LogLevel::DEBUG, "Converted LE values: hash=0x%016lX timestamp=%lu", extracted_hash, extracted_timestamp);
     
     // Extract Reserved bits value
     uint8_t tcp_flags_byte = layers.l4_header[12];
@@ -117,8 +117,8 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
     }
     
     // Debug: Show timestamp comparison
-    LOG(LogLevel::DEBUG, "Timestamp comparison: rx=%lu extracted=%lu has_ts=%s hw=%s", 
-        rx_timestamp_ns, extracted_timestamp, has_timestamp ? "true" : "false", is_hw_timestamp ? "true" : "false");
+    // LOG(LogLevel::DEBUG, "Timestamp comparison: rx=%lu extracted=%lu has_ts=%s hw=%s", 
+    //     rx_timestamp_ns, extracted_timestamp, has_timestamp ? "true" : "false", is_hw_timestamp ? "true" : "false");
     
     uint64_t latency_ns = 0;
     bool negative_latency = false;

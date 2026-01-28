@@ -384,9 +384,9 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
                    layers.l4_header != nullptr);
     
     if (layers.valid) {
-        LOG(LogLevel::DEBUG, "parse_packet_layers: VALID - IPv%u proto=%u eth_len=%u ip_len=%u l4_len=%u payload_len=%u", 
-            layers.ip_version, layers.l4_protocol, layers.eth_header_len, 
-            layers.ip_header_len, layers.l4_header_len, layers.l4_payload_len);
+        // LOG(LogLevel::DEBUG, "parse_packet_layers: VALID - IPv%u proto=%u eth_len=%u ip_len=%u l4_len=%u payload_len=%u", 
+        //     layers.ip_version, layers.l4_protocol, layers.eth_header_len, 
+        //     layers.ip_header_len, layers.l4_header_len, layers.l4_payload_len);
     } else {
         LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - missing required pointers (eth=%p ip=%p l4=%p)", 
             layers.eth_header, layers.ip_header, layers.l4_header);
