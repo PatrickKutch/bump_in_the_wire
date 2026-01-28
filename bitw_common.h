@@ -111,6 +111,7 @@ struct SFlowConfig {
     uint32_t sampling_rate = 0;  // 0 = disabled, N = sample 1 out of N packets
     std::vector<uint16_t> ethertypes;
     bool skip_vlan = true;       // true = skip VLAN tags to find EtherType
+    uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Magic destination MAC
     
     bool is_enabled() const { return sampling_rate > 0 && !ethertypes.empty(); }
 };
@@ -153,6 +154,7 @@ bool extract_hw_timestamp(int sockfd, uint64_t& timestamp_ns);
 
 // S-Flow configuration parsing
 bool parse_ethertypes(const char* str, std::vector<uint16_t>& ethertypes);
+bool parse_mac_address(const char* str, uint8_t* mac);
 bool get_ethertype(const uint8_t* frame, uint32_t len, uint16_t& ether_type_out, bool skip_vlan);
 
 // Packet parsing helper

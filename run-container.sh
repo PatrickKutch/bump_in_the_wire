@@ -68,6 +68,6 @@ exec docker run \
     -v /sys/fs/bpf:/sys/fs/bpf \
     -v /sys:/sys \
     -v /proc:/proc \
-    -e PROGRAM_MODE="$PROGRAM_MODE" \
+    -e BITW_MODE="$PROGRAM_MODE" \
     bitw_xdp:docker-only \
     "$INTERFACE_A" "$INTERFACE_B" "$@"

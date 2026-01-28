@@ -58,74 +58,68 @@ static inline uint64_t calculate_packet_hash(const uint8_t* data, uint32_t len) 
     return static_cast<uint64_t>(hasher(hash_str));
 }
 
-// Check if a packet is TCP by examining the IP protocol field
-static inline bool is_tcp_packet(const uint8_t* frame, uint32_t len) {
-    PacketLayers layers = parse_packet_layers(frame, len, 6); // 6 = TCP protocol
-    return layers.valid && layers.l4_protocol == 6;
-}
-
-// Create a tagged TCP packet copy for S-Flow processing
-static std::unique_ptr<SFlowPacket> create_tagged_tcp_packet(const uint8_t* frame, uint32_t len, 
-                                                           uint64_t timestamp_ns, bool has_timestamp) {
+// Create a magic MAC watermark packet for S-Flow processing  
+static std::unique_ptr<SFlowPacket> create_watermark_packet(const uint8_t* frame, uint32_t len,
+                                                          uint64_t timestamp_ns, bool has_timestamp,
+                                                          const uint8_t* magic_mac) {
+    // Skip PTP packets (EtherType 0x88f7) - never watermark them
+    uint16_t ethertype = 0;
+    if (parse_ethertype_vlan_aware(frame, len, ethertype) && ethertype == 0x88f7) {
+        return nullptr;  // Don't create watermark for PTP packets
+    }
+    
     // Parse packet layers
-    PacketLayers layers = parse_packet_layers(frame, len, 6); // 6 = TCP protocol
+    PacketLayers layers = parse_packet_layers(frame, len);
     if (!layers.valid) {
-        LOG(LogLevel::WARN, "Failed to parse TCP packet for tagging, returning original");
-        return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
+        LOG(LogLevel::WARN, "Failed to parse packet for watermarking, skipping");
+        return nullptr;
     }
     
     // Calculate hash of original packet
     uint64_t packet_hash = calculate_packet_hash(frame, len);
     
-    // Create new payload: [hash:8][timestamp:8] = 16 bytes
-    const uint32_t new_payload_size = 16;
-    std::vector<uint8_t> new_payload(new_payload_size);
+    // Create watermark payload: [hash:8][timestamp:8] = 16 bytes
+    const uint32_t watermark_payload_size = 16;
+    std::vector<uint8_t> watermark_payload(watermark_payload_size);
     
     // Pack hash and timestamp in network byte order
     uint64_t hash_be = htobe64(packet_hash);
     uint64_t timestamp_be = htobe64(timestamp_ns);
-    std::memcpy(new_payload.data(), &hash_be, 8);
-    std::memcpy(new_payload.data() + 8, &timestamp_be, 8);
+    std::memcpy(watermark_payload.data(), &hash_be, 8);
+    std::memcpy(watermark_payload.data() + 8, &timestamp_be, 8);
     
-    // Calculate new packet size: headers + new payload
+    // Calculate watermark packet size: headers + watermark payload
     uint32_t headers_size = layers.eth_header_len + layers.ip_header_len + layers.l4_header_len;
-    uint32_t new_packet_size = headers_size + new_payload_size;
-    std::vector<uint8_t> modified_frame(new_packet_size);
+    uint32_t watermark_packet_size = headers_size + watermark_payload_size;
+    std::vector<uint8_t> watermark_frame(watermark_packet_size);
     
-    // Copy all headers (Ethernet + IP + TCP)
-    std::memcpy(modified_frame.data(), frame, headers_size);
+    // Copy all headers (Ethernet + IP + L4)
+    std::memcpy(watermark_frame.data(), frame, headers_size);
     
-    // Append new payload
-    std::memcpy(modified_frame.data() + headers_size, new_payload.data(), new_payload_size);
+    // Replace destination MAC with magic MAC address
+    std::memcpy(watermark_frame.data(), magic_mac, 6);
+    
+    // Append watermark payload
+    std::memcpy(watermark_frame.data() + headers_size, watermark_payload.data(), watermark_payload_size);
     
     // Update IP length field based on IP version
     if (layers.ip_version == 4) {
         // Update IPv4 total length field
-        uint16_t ip_total_len = layers.ip_header_len + layers.l4_header_len + new_payload_size;
+        uint16_t ip_total_len = layers.ip_header_len + layers.l4_header_len + watermark_payload_size;
         uint16_t ip_total_len_be = htons(ip_total_len);
-        std::memcpy(modified_frame.data() + layers.eth_header_len + 2, &ip_total_len_be, 2);
+        std::memcpy(watermark_frame.data() + layers.eth_header_len + 2, &ip_total_len_be, 2);
     } else if (layers.ip_version == 6) {
         // Update IPv6 payload length field
-        uint16_t ipv6_payload_len = layers.l4_header_len + new_payload_size;
+        uint16_t ipv6_payload_len = layers.l4_header_len + watermark_payload_size;
         uint16_t ipv6_payload_len_be = htons(ipv6_payload_len);
-        std::memcpy(modified_frame.data() + layers.eth_header_len + 4, &ipv6_payload_len_be, 2);
+        std::memcpy(watermark_frame.data() + layers.eth_header_len + 4, &ipv6_payload_len_be, 2);
     }
     
-    // Set TCP Reserved bits with random tag
-    uint32_t reserved_byte_offset = layers.eth_header_len + layers.ip_header_len + 12; // TCP flags byte
-    static thread_local std::random_device rd;
-    static thread_local std::mt19937 gen(rd());
-    static thread_local std::uniform_int_distribution<> dis(1, 15);
-    uint8_t random_tag = static_cast<uint8_t>(dis(gen));
+    LOG(LogLevel::DEBUG, "Watermark packet: hash=0x%016lX timestamp=%lu payload_size=%u magic_mac=%02X:%02X:%02X:%02X:%02X:%02X IPv%u",
+        packet_hash, timestamp_ns, watermark_payload_size, 
+        magic_mac[0], magic_mac[1], magic_mac[2], magic_mac[3], magic_mac[4], magic_mac[5], layers.ip_version);
     
-    uint8_t tcp_flags_byte = modified_frame[reserved_byte_offset];
-    tcp_flags_byte = (tcp_flags_byte & 0x0F) | (random_tag << 4);
-    modified_frame[reserved_byte_offset] = tcp_flags_byte;
-    
-    LOG(LogLevel::DEBUG, "Tagged TCP packet: hash=0x%016lX timestamp=%lu payload_size=%u reserved_bits=0x%02X IPv%u",
-        packet_hash, timestamp_ns, new_payload_size, random_tag, layers.ip_version);
-    
-    return std::make_unique<SFlowPacket>(modified_frame.data(), new_packet_size, timestamp_ns, has_timestamp);
+    return std::make_unique<SFlowPacket>(watermark_frame.data(), watermark_packet_size, timestamp_ns, has_timestamp);
 }
 
 static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
@@ -135,26 +129,17 @@ static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const 
     
     if (has_timestamp) {
         const char* ts_type = is_hw_timestamp ? "HW" : "SW";
-        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=%lu ns (%s) skip_vlan=%s",
+        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=%lu ns (%s)",
             tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
-            timestamp_ns, ts_type, config.skip_vlan ? "true" : "false");
+            timestamp_ns, ts_type);
     } else {
-        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=none skip_vlan=%s",
-            tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype),
-            config.skip_vlan ? "true" : "false");
+        LOG(LogLevel::INFO, "[%s SFLOW] Sample #%u: len=%u ethertype=0x%04x (%s) timestamp=none",
+            tag, state.sampled_count, len, ethertype, ethertype_to_str(ethertype));
     }
     
-    // Create a copy of the packet to be sent after the original
-    // Check if this is a TCP packet and handle it specially
-    if (is_tcp_packet(frame, len)) {
-        LOG(LogLevel::INFO, "[%s SFLOW] TCP packet detected, creating tagged copy", tag);
-        return create_tagged_tcp_packet(frame, len, timestamp_ns, has_timestamp);
-    } else {
-        // For non-TCP packets, create a standard copy
-        // LOG(LogLevel::INFO, "[%s SFLOW] Creating packet copy for transmission", tag);
-        // return std::make_unique<SFlowPacket>(frame, len, timestamp_ns, has_timestamp);
-        return nullptr;
-    }
+    // Create watermark packet with magic MAC address (works for any protocol)
+    LOG(LogLevel::INFO, "[%s SFLOW] Creating watermark packet with magic MAC", tag);
+    return create_watermark_packet(frame, len, timestamp_ns, has_timestamp, config.dest_mac);
 }
 
 // -----------------------------------------------------------------------------
@@ -228,6 +213,11 @@ void forward_step(const char* tag,
                 uint16_t et = 0;
                 
                 if (get_ethertype(frame, rx_lens[i], et, sflow_config->skip_vlan)) {
+                    // Skip PTP packets (EtherType 0x88f7) - never sample them
+                    if (et == 0x88f7) {
+                        continue; // Skip sampling for PTP packets
+                    }
+                    
                     // Check if this EtherType is in our sample list
                     for (uint16_t target_et : sflow_config->ethertypes) {
                         if (et == target_et) {
@@ -424,12 +414,13 @@ static void print_usage(const char* prog) {
         << "  --sample.sampling N     Sample 1 out of every N packets (0=disabled, e.g. 1000)\n"
         << "  --sample.ethertypes L   Comma-separated EtherTypes to sample (e.g. 0x800,0x86DD)\n"
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
+        << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
         << "\nEnvironment:\n"
         << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + length)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1 --cpu-a 2 --cpu-b 3\n"
         << "  " << prog << " PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
-        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.ethertypes=0x800 --sample.skip_vlan false\n";
+        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01\n";
 }
 
 static bool parse_args(int argc, char** argv, Cmd& cmd) {
@@ -500,6 +491,17 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
                 cmd.sflow.skip_vlan = false;
             } else {
                 std::cerr << "Invalid skip_vlan value: " << skip_str << " (use true/false)\n";
+                return false;
+            }
+        } else if (option == "--sample.dest_mac") {
+            std::string mac_str = (eq_pos != std::string::npos) ? value : 
+                                 (i + 1 < argc ? argv[++i] : "");
+            if (mac_str.empty()) {
+                std::cerr << "Missing value for --sample.dest_mac\n";
+                return false;
+            }
+            if (!parse_mac_address(mac_str.c_str(), cmd.sflow.dest_mac)) {
+                std::cerr << "Failed to parse destination MAC address\n";
                 return false;
             }
         } else {
@@ -607,6 +609,9 @@ int main(int argc, char** argv) {
         LOG(LogLevel::INFO, "S-Flow sampling enabled for A→B traffic:");
         LOG(LogLevel::INFO, "  - Sampling rate: 1 in %u packets", cmd.sflow.sampling_rate);
         LOG(LogLevel::INFO, "  - Skip VLAN tags: %s", cmd.sflow.skip_vlan ? "true" : "false");
+        LOG(LogLevel::INFO, "  - Destination MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+            cmd.sflow.dest_mac[0], cmd.sflow.dest_mac[1], cmd.sflow.dest_mac[2],
+            cmd.sflow.dest_mac[3], cmd.sflow.dest_mac[4], cmd.sflow.dest_mac[5]);
         std::stringstream ss;
         for (size_t i = 0; i < cmd.sflow.ethertypes.size(); ++i) {
             if (i > 0) ss << ", ";

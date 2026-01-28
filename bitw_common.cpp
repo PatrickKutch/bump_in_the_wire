@@ -218,6 +218,39 @@ bool parse_ethertypes(const char* str, std::vector<uint16_t>& ethertypes) {
     return !ethertypes.empty();
 }
 
+bool parse_mac_address(const char* str, uint8_t* mac) {
+    if (!str || !*str || !mac) return false;
+    
+    // Parse MAC format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+    int values[6];
+    int count = sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x", 
+                      &values[0], &values[1], &values[2], 
+                      &values[3], &values[4], &values[5]);
+    
+    if (count != 6) {
+        // Try dash format
+        count = sscanf(str, "%02x-%02x-%02x-%02x-%02x-%02x", 
+                      &values[0], &values[1], &values[2], 
+                      &values[3], &values[4], &values[5]);
+    }
+    
+    if (count != 6) {
+        std::cerr << "Invalid MAC address format: " << str << " (use XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX)\n";
+        return false;
+    }
+    
+    // Check range and copy
+    for (int i = 0; i < 6; i++) {
+        if (values[i] < 0 || values[i] > 255) {
+            std::cerr << "Invalid MAC address byte value: " << values[i] << "\n";
+            return false;
+        }
+        mac[i] = static_cast<uint8_t>(values[i]);
+    }
+    
+    return true;
+}
+
 // Get EtherType with optional VLAN skipping
 bool get_ethertype(const uint8_t* frame, uint32_t len, uint16_t& ether_type_out, bool skip_vlan) {
     if (skip_vlan) {
@@ -239,6 +272,7 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
     layers.packet_len = packet_len;
     
     if (packet_len < 14) {
+        LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - packet too short (%u bytes, need >= 14)", packet_len);
         return layers; // Too short for Ethernet header
     }
     
@@ -249,6 +283,7 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
     // Handle VLAN tags
     uint16_t ethertype = 0;
     if (!parse_ethertype_vlan_aware(packet, packet_len, ethertype)) {
+        LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - failed to parse EtherType (VLAN-aware)");
         return layers;
     }
     
@@ -279,6 +314,10 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
         
         if (packet_len >= eth_offset + ihl) {
             layers.l4_header = packet + eth_offset + ihl;
+        } else {
+            LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - IPv4 packet too short for IP header (len=%u, need %u)", 
+                packet_len, eth_offset + ihl);
+            return layers;
         }
     } else if (ethertype == 0x86DD && packet_len >= eth_offset + 40) { // IPv6
         layers.ip_header = packet + eth_offset;
@@ -290,13 +329,21 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
         
         if (packet_len >= eth_offset + 40) {
             layers.l4_header = packet + eth_offset + 40;
+        } else {
+            LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - IPv6 packet too short for header (len=%u, need %u)", 
+                packet_len, eth_offset + 40);
+            return layers;
         }
     } else {
+        // LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - unsupported EtherType 0x%04x or insufficient length (len=%u, eth_offset=%u)", 
+        //     ethertype, packet_len, eth_offset);
         return layers; // Unsupported or malformed IP
     }
     
     // If target protocol specified, check if it matches
     if (target_protocol != 0 && layers.l4_protocol != target_protocol) {
+        // LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - protocol mismatch (want %u, got %u)", 
+        //     target_protocol, layers.l4_protocol);
         return layers; // Protocol mismatch
     }
     
@@ -308,24 +355,42 @@ PacketLayers parse_packet_layers(const uint8_t* packet, uint32_t packet_len, uin
             // Could parse TCP header length from data offset field if needed
             layers.l4_payload = packet + l4_offset + layers.l4_header_len;
             layers.l4_payload_len = packet_len - l4_offset - layers.l4_header_len;
+        } else {
+            LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - TCP packet too short (len=%u, need %u for L4)", 
+                packet_len, l4_offset + 20);
+            return layers;
         }
     } else if (layers.l4_protocol == 17) { // UDP
         if (packet_len >= l4_offset + 8) { // UDP header is always 8 bytes
             layers.l4_header_len = 8;
             layers.l4_payload = packet + l4_offset + 8;
             layers.l4_payload_len = packet_len - l4_offset - 8;
+        } else {
+            LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - UDP packet too short (len=%u, need %u for L4)", 
+                packet_len, l4_offset + 8);
+            return layers;
         }
     } else {
         // Other protocols - just point to the header without parsing payload
         layers.l4_header_len = 0; // Unknown header length
         layers.l4_payload = layers.l4_header;
         layers.l4_payload_len = packet_len - l4_offset;
+        LOG(LogLevel::DEBUG, "parse_packet_layers: Other protocol %u (ICMP, etc.) - marked valid", layers.l4_protocol);
     }
     
     // Mark as valid if we have all required pointers
     layers.valid = (layers.eth_header != nullptr && 
                    layers.ip_header != nullptr && 
                    layers.l4_header != nullptr);
+    
+    if (layers.valid) {
+        LOG(LogLevel::DEBUG, "parse_packet_layers: VALID - IPv%u proto=%u eth_len=%u ip_len=%u l4_len=%u payload_len=%u", 
+            layers.ip_version, layers.l4_protocol, layers.eth_header_len, 
+            layers.ip_header_len, layers.l4_header_len, layers.l4_payload_len);
+    } else {
+        LOG(LogLevel::DEBUG, "parse_packet_layers: INVALID - missing required pointers (eth=%p ip=%p l4=%p)", 
+            layers.eth_header, layers.ip_header, layers.l4_header);
+    }
     
     return layers;
 }
