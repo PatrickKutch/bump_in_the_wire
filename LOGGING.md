@@ -58,7 +58,7 @@ sudo docker run --privileged --network=host --rm \
     -v /sys:/sys \
     -v /proc:/proc \
     -v /var/log/bitw_xdp:/app/logs \
-    bitw_xdp:docker-only PF0 PF1 --cpu.forwarding 2 --cpu.return 3 2>&1 | tee /app/logs/bitw_xdp.log
+    bitw_xdp:docker-only eth0 eth1 --cpu.forwarding 2 --cpu.return 3 2>&1 | tee /app/logs/bitw_xdp.log
 ```
 
 **Pros:**
@@ -83,7 +83,7 @@ sudo docker run --log-driver=syslog --log-opt syslog-address=udp://localhost:514
     -v /sys/fs/bpf:/sys/fs/bpf \
     -v /sys:/sys \
     -v /proc:/proc \
-    bitw_xdp:docker-only PF0 PF1
+    bitw_xdp:docker-only eth0 eth1
 ```
 
 **Pros:**
@@ -106,7 +106,7 @@ sudo docker run --log-driver=fluentd --log-opt fluentd-address=localhost:24224 \
     -v /sys/fs/bpf:/sys/fs/bpf \
     -v /sys:/sys \
     -v /proc:/proc \
-    bitw_xdp:docker-only PF0 PF1
+    bitw_xdp:docker-only eth0 eth1
 
 # Or using journald
 sudo docker run --log-driver=journald \
@@ -114,7 +114,7 @@ sudo docker run --log-driver=journald \
     -v /sys/fs/bpf:/sys/fs/bpf \
     -v /sys:/sys \
     -v /proc:/proc \
-    bitw_xdp:docker-only PF0 PF1
+    bitw_xdp:docker-only eth0 eth1
 ```
 
 ## Verbose Debug Logging
@@ -124,7 +124,7 @@ Enable detailed packet inspection:
 sudo docker run --privileged --network=host --rm \
     -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
     -e BUMP_VERBOSE=1 \
-    bitw_xdp:docker-only PF0 PF1
+    bitw_xdp:docker-only eth0 eth1
 ```
 
 This adds DEBUG level logs showing:

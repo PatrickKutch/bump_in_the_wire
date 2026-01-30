@@ -547,8 +547,8 @@ static void print_usage(const char* prog) {
         << "  --verbose               Enable per-packet debug prints (EtherType + length)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
-        << "  " << prog << " PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
-        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01 --log-level INFO\n";
+        << "  " << prog << " eth0 eth1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
+        << "  " << prog << " eth0 eth1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01 --log-level INFO\n";
 }
 
 static bool parse_args(int argc, char** argv, Cmd& cmd) {

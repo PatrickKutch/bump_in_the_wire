@@ -1,4 +1,75 @@
 #include "bitw_common.h"
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+
+// -----------------------------------------------------------------------------
+// Thread-safe queue template
+// -----------------------------------------------------------------------------
+template<typename T>
+class ThreadSafeQueue {
+private:
+    mutable std::mutex mutex_;
+    std::queue<T> queue_;
+    std::condition_variable condition_;
+
+public:
+    void push(T item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(std::move(item));
+        condition_.notify_one();
+    }
+
+    bool try_pop(T& item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return false;
+        }
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    bool wait_and_pop(T& item, int timeout_ms = -1) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (timeout_ms < 0) {
+            condition_.wait(lock, [this] { return !queue_.empty(); });
+        } else {
+            if (!condition_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+                                   [this] { return !queue_.empty(); })) {
+                return false; // timeout
+            }
+        }
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Watermarked packet structure for queue communication
+// -----------------------------------------------------------------------------
+struct WatermarkedPacket {
+    std::vector<uint8_t> data;
+    uint32_t length;
+    PacketLayers layers;
+    int socket_fd;
+    
+    WatermarkedPacket(const uint8_t* frame, uint32_t len, const PacketLayers& pkt_layers, int fd)
+        : data(frame, frame + len), length(len), layers(pkt_layers), socket_fd(fd) {}
+};
 
 // -----------------------------------------------------------------------------
 // Watermark detection and filtering functions
@@ -125,13 +196,44 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
 }
 
 // -----------------------------------------------------------------------------
+// Watermark processing thread
+// -----------------------------------------------------------------------------
+void watermark_processing_worker(const char* tag,
+                               ThreadSafeQueue<WatermarkedPacket>& input_queue,
+                               std::atomic<bool>& running,
+                               int cpu_pin) {
+    if (cpu_pin >= 0) {
+        if (pin_current_thread_to_cpu(cpu_pin) == 0) {
+            LOG(LogLevel::INFO, "[%s WMARK-PROC] pinned to CPU %d", tag, cpu_pin);
+        }
+    }
+
+    LOG(LogLevel::INFO, "[%s WMARK-PROC] Processing thread started", tag);
+
+    while (running.load(std::memory_order_relaxed)) {
+        WatermarkedPacket watermarked_packet{nullptr, 0, {}, -1}; // dummy initialization
+        
+        // Wait for watermarked packets to process (100ms timeout to check running flag)
+        if (input_queue.wait_and_pop(watermarked_packet, 100)) {
+            // Process the watermarked packet
+            process_watermarked_packet(tag, watermarked_packet.layers, 
+                                     watermarked_packet.length, 
+                                     watermarked_packet.socket_fd);
+        }
+    }
+
+    LOG(LogLevel::INFO, "[%s WMARK-PROC] Processing thread shutting down", tag);
+}
+
+// -----------------------------------------------------------------------------
 // Filtering: RX -> analyze -> optionally drop watermarked packets
 // -----------------------------------------------------------------------------
 void filter_step(const char* tag,
                  XskEndpoint& in_ep, UmemArea& in_umem,
                  XskEndpoint& out_ep, UmemArea& out_umem,
                  bool debug_print = false,
-                 const uint8_t* watermark_dest_mac = nullptr)
+                 const uint8_t* watermark_dest_mac = nullptr,
+                 ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr)
 {
     static constexpr uint32_t BATCH = 64;
     static uint32_t total_packets = 0;
@@ -191,7 +293,14 @@ void filter_step(const char* tag,
                         dropped_packets++;
                         forward_packet[i] = false; // Drop watermarked packet
                         
-                        process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd);
+                        // Queue watermarked packet for processing in separate thread
+                        if (watermark_queue) {
+                            WatermarkedPacket watermarked_pkt(frame, rx_lens[i], layers, in_ep.fd);
+                            watermark_queue->push(std::move(watermarked_pkt));
+                        } else {
+                            // Fallback to direct processing if no queue provided
+                            process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd);
+                        }
                     }
                 }
                 // If MAC doesn't match magic MAC, packet is forwarded normally
@@ -294,7 +403,8 @@ void filter_worker(const char* tag,
                    std::atomic<bool>* running,
                    bool debug_print,
                    int cpu_pin,
-                   const uint8_t* watermark_dest_mac)
+                   const uint8_t* watermark_dest_mac,
+                   ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr)
 {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
@@ -313,7 +423,7 @@ void filter_worker(const char* tag,
             perror("poll");
             break;
         }
-        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_dest_mac);
+        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_dest_mac, watermark_queue);
     }
 }
 
@@ -347,9 +457,9 @@ static void print_usage(const char* prog) {
         << "  --verbose               Enable per-packet debug prints (EtherType + action)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1\n"
-        << "  " << prog << " PF0 PF1 --cpu.forwarding 2 --cpu.return 3\n"
-        << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01\n"
-        << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
+        << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
+        << "  " << prog << " eth0 eth1 --watermark.dest_mac=02:00:00:00:00:01\n"
+        << "  " << prog << " eth0 eth1 --watermark.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
         << "\nWatermark Detection:\n"
         << "  - Looks for TCP packets with non-zero Reserved bits\n"
         << "  - Expects 16-byte payload containing [hash:8][timestamp:8]\n"
@@ -535,6 +645,28 @@ int main(int argc, char** argv) {
         cmd.dest_mac[3], cmd.dest_mac[4], cmd.dest_mac[5]);
     LOG(LogLevel::INFO, "Only packets with magic MAC will be checked for watermarks");
     LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional filtering (multi-threaded)...");
+
+    // --- Watermark processing state and queue (only needed for A→B direction) ---
+    ThreadSafeQueue<WatermarkedPacket> watermark_queue;
+    
+    // Determine watermark processing CPU
+    int watermark_processing_cpu = -1; // no pinning by default
+    if (cmd.cpu_forwarding_cores[1] >= 0) {
+        // Two cores specified: 2nd core for watermark processing
+        watermark_processing_cpu = cmd.cpu_forwarding_cores[1];
+        LOG(LogLevel::INFO, "Watermark processing will use CPU %d (separate from forwarding)", watermark_processing_cpu);
+    } else if (cmd.cpu_forwarding_cores[0] >= 0) {
+        // One core specified: same core as forwarding
+        watermark_processing_cpu = cmd.cpu_forwarding_cores[0];
+        LOG(LogLevel::INFO, "Watermark processing will use CPU %d (shared with forwarding)", watermark_processing_cpu);
+    }
+    
+    // --- Launch watermark processing thread ---
+    std::thread t_watermark_proc(
+        watermark_processing_worker, "A→B",
+        std::ref(watermark_queue),
+        std::ref(g_running),
+        watermark_processing_cpu);
     
     // --- Launch one worker thread per direction, with optional CPU pinning ---
     std::thread t_ab(
@@ -542,18 +674,19 @@ int main(int argc, char** argv) {
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_forwarding_cores[0], cmd.dest_mac);
+        cmd.cpu_forwarding_cores[0], cmd.dest_mac, &watermark_queue);
 
     std::thread t_ba(
         filter_worker, "B→A",
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_return, cmd.dest_mac);
+        cmd.cpu_return, cmd.dest_mac, nullptr); // No watermark processing for B→A
 
     // Wait for Ctrl-C
     t_ab.join();
     t_ba.join();
+    t_watermark_proc.join();
 
     // Cleanup
     xsk_socket__delete(epB.xsk);

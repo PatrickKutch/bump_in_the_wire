@@ -98,8 +98,8 @@ The `run-container.sh` script simplifies container execution:
 
 ```bash
 # S-Flow sampling (default mode)
-sudo ./run-container.sh PF0 PF1
-sudo ./run-container.sh --mode sflow PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800
+sudo ./run-container.sh eth0 eth1
+sudo ./run-container.sh --mode sflow eth0 eth1 --sample.sampling=1000 --sample.ethertypes=0x800
 
 # Watermark filtering
 sudo ./run-container.sh --mode filter eth0 eth1 --cpu.forwarding 4 --cpu.return 8 --watermark.ethertypes=0x800,0x86DD
@@ -120,7 +120,7 @@ sudo docker run --privileged --network=host --rm \
 # With sampling configuration
 sudo docker run --privileged --network=host --rm \
     -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
-    bitw_xdp:docker-only PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800,0x86DD --sample.skip_vlan=true
+    bitw_xdp:docker-only eth0 eth1 --sample.sampling=1000 --sample.ethertypes=0x800,0x86DD --sample.skip_vlan=true
 
 # With CPU pinning
 sudo docker run --privileged --network=host --rm \
@@ -144,7 +144,7 @@ Podman commands are identical to Docker, just replace `docker` with `podman`:
 # S-Flow sampling
 sudo podman run --privileged --network=host --rm \
     -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
-    bitw_xdp:docker-only PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800
+    bitw_xdp:docker-only eth0 eth1 --sample.sampling=1000 --sample.ethertypes=0x800
 
 # Watermark filtering
 sudo podman run --privileged --network=host --rm \
