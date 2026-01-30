@@ -49,13 +49,21 @@
 // -----------------------------------------------------------------------------
 enum class LogLevel { DEBUG, INFO, WARN, ERROR };
 
+// Global log level and verbose settings
+extern LogLevel g_log_level;
+extern bool g_verbose_mode;
+
 const char* log_level_str(LogLevel level);
 std::string get_timestamp();
+void set_log_level(LogLevel level);
+void set_verbose_mode(bool verbose);
 
 #define LOG(level, ...) do { \
-    std::fprintf(stderr, "[%s] [%s] ", get_timestamp().c_str(), log_level_str(level)); \
-    std::fprintf(stderr, __VA_ARGS__); \
-    std::fprintf(stderr, "\n"); \
+    if (level >= g_log_level) { \
+        std::fprintf(stderr, "[%s] [%s] ", get_timestamp().c_str(), log_level_str(level)); \
+        std::fprintf(stderr, __VA_ARGS__); \
+        std::fprintf(stderr, "\n"); \
+    } \
 } while(0)
 
 // -----------------------------------------------------------------------------

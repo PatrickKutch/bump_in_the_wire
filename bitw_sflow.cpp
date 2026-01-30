@@ -1,4 +1,79 @@
 #include "bitw_common.h"
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+
+// -----------------------------------------------------------------------------
+// Thread-safe queue template
+// -----------------------------------------------------------------------------
+template<typename T>
+class ThreadSafeQueue {
+private:
+    mutable std::mutex mutex_;
+    std::queue<T> queue_;
+    std::condition_variable condition_;
+
+public:
+    void push(T item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push(std::move(item));
+        condition_.notify_one();
+    }
+
+    bool try_pop(T& item) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return false;
+        }
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    bool wait_and_pop(T& item, int timeout_ms = -1) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (timeout_ms < 0) {
+            condition_.wait(lock, [this] { return !queue_.empty(); });
+        } else {
+            if (!condition_.wait_for(lock, std::chrono::milliseconds(timeout_ms), 
+                                   [this] { return !queue_.empty(); })) {
+                return false; // timeout
+            }
+        }
+        item = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+};
+
+// -----------------------------------------------------------------------------
+// S-Flow packet structures for queue communication
+// -----------------------------------------------------------------------------
+struct SFlowInputPacket {
+    std::vector<uint8_t> data;
+    uint32_t length;
+    uint16_t ethertype;
+    uint64_t timestamp_ns;
+    bool has_timestamp;
+    bool is_hw_timestamp;
+    
+    SFlowInputPacket(const uint8_t* frame, uint32_t len, uint16_t et,
+                     uint64_t ts_ns = 0, bool has_ts = false, bool is_hw_ts = false)
+        : data(frame, frame + len), length(len), ethertype(et),
+          timestamp_ns(ts_ns), has_timestamp(has_ts), is_hw_timestamp(is_hw_ts) {}
+};
 
 // -----------------------------------------------------------------------------
 // S-Flow specific functions
@@ -143,6 +218,50 @@ static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const 
 }
 
 // -----------------------------------------------------------------------------
+// S-Flow processing thread
+// -----------------------------------------------------------------------------
+void sflow_processing_worker(const char* tag,
+                            ThreadSafeQueue<SFlowInputPacket>& input_queue,
+                            ThreadSafeQueue<std::unique_ptr<SFlowPacket>>& output_queue,
+                            const SFlowConfig& config,
+                            SFlowState& state,
+                            std::atomic<bool>& running,
+                            int cpu_pin) {
+    if (cpu_pin >= 0) {
+        if (pin_current_thread_to_cpu(cpu_pin) == 0) {
+            LOG(LogLevel::INFO, "[%s SFLOW-PROC] pinned to CPU %d", tag, cpu_pin);
+        }
+    }
+
+    LOG(LogLevel::INFO, "[%s SFLOW-PROC] Processing thread started", tag);
+
+    while (running.load(std::memory_order_relaxed)) {
+        SFlowInputPacket input_packet{nullptr, 0, 0}; // dummy initialization
+        
+        // Wait for packets to process (100ms timeout to check running flag)
+        if (input_queue.wait_and_pop(input_packet, 100)) {
+            // Process the S-Flow sample
+            auto sflow_pkt = process_sflow_sample(tag, 
+                                                input_packet.data.data(), 
+                                                input_packet.length,
+                                                input_packet.ethertype, 
+                                                config, 
+                                                state,
+                                                input_packet.timestamp_ns, 
+                                                input_packet.has_timestamp, 
+                                                input_packet.is_hw_timestamp);
+            
+            if (sflow_pkt) {
+                // Queue the processed packet for transmission
+                output_queue.push(std::move(sflow_pkt));
+            }
+        }
+    }
+
+    LOG(LogLevel::INFO, "[%s SFLOW-PROC] Processing thread shutting down", tag);
+}
+
+// -----------------------------------------------------------------------------
 // Forwarding: RX -> copy -> TX -> recycle (with S-Flow sampling)
 // -----------------------------------------------------------------------------
 void forward_step(const char* tag,
@@ -150,7 +269,9 @@ void forward_step(const char* tag,
                   XskEndpoint& out_ep, UmemArea& out_umem,
                   bool debug_print = false,
                   const SFlowConfig* sflow_config = nullptr,
-                  SFlowState* sflow_state = nullptr)
+                  SFlowState* sflow_state = nullptr,
+                  ThreadSafeQueue<SFlowInputPacket>* sflow_input_queue = nullptr,
+                  ThreadSafeQueue<std::unique_ptr<SFlowPacket>>* sflow_output_queue = nullptr)
 {
     static constexpr uint32_t BATCH = 64;
 
@@ -199,10 +320,9 @@ void forward_step(const char* tag,
     }
     
     // S-Flow sampling (only for A→B direction indicated by tag)
-    std::vector<std::unique_ptr<SFlowPacket>> sflow_packets;
     if (sflow_config && sflow_config->is_enabled() && sflow_state && 
         sflow_config->sampling_rate > 0 && 
-        std::strcmp(tag, "A→B") == 0) {
+        std::strcmp(tag, "A→B") == 0 && sflow_input_queue) {
         
         for (unsigned int i = 0; i < rcvd; ++i) {
             sflow_state->packet_count++;
@@ -243,11 +363,10 @@ void forward_step(const char* tag,
                                 }
                             }
                             
-                            auto sflow_pkt = process_sflow_sample(tag, frame, rx_lens[i], et, *sflow_config, *sflow_state,
-                                                                timestamp_ns, has_timestamp, is_hw_timestamp);
-                            if (sflow_pkt) {
-                                sflow_packets.push_back(std::move(sflow_pkt));
-                            }
+                            // Queue packet for S-Flow processing
+                            SFlowInputPacket input_packet(frame, rx_lens[i], et, 
+                                                        timestamp_ns, has_timestamp, is_hw_timestamp);
+                            sflow_input_queue->push(std::move(input_packet));
                             break; // Only sample once per packet even if multiple matches
                         }
                     }
@@ -302,11 +421,11 @@ void forward_step(const char* tag,
         (void)sendto(out_ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0); // TX kick
     }
     
-    // 5.5) Send S-Flow packets if any were generated
-    if (!sflow_packets.empty()) {
-        LOG(LogLevel::DEBUG, "[%s] Sending %zu S-Flow packet copies", tag, sflow_packets.size());
-        
-        for (const auto& sflow_pkt : sflow_packets) {
+    // 5.5) Send S-Flow packets from processing queue if any are ready
+    if (sflow_output_queue) {
+        std::unique_ptr<SFlowPacket> sflow_pkt;
+        while (sflow_output_queue->try_pop(sflow_pkt)) {
+            
             // Try to reserve one more TX slot for the S-Flow packet
             uint32_t sflow_tx_idx = 0;
             unsigned int sflow_tx_space = xsk_ring_prod__reserve(&out_ep.tx, 1, &sflow_tx_idx);
@@ -339,6 +458,10 @@ void forward_step(const char* tag,
                 }
             } else {
                 LOG(LogLevel::WARN, "[%s] No TX space available for S-Flow packet", tag);
+                // Put the packet back in the queue for later processing
+                // Note: We can't put it back easily without copying, so we'll just drop it
+                // In a production system, you might want a more sophisticated retry mechanism
+                break; // Stop processing more packets from queue
             }
         }
     }
@@ -370,7 +493,9 @@ void forward_worker(const char* tag,
                     bool debug_print,
                     int cpu_pin, /* -1 = no pin */
                     const SFlowConfig* sflow_config = nullptr,
-                    SFlowState* sflow_state = nullptr)
+                    SFlowState* sflow_state = nullptr,
+                    ThreadSafeQueue<SFlowInputPacket>* sflow_input_queue = nullptr,
+                    ThreadSafeQueue<std::unique_ptr<SFlowPacket>>* sflow_output_queue = nullptr)
 {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
@@ -389,7 +514,7 @@ void forward_worker(const char* tag,
             perror("poll");
             break;
         }
-        forward_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, sflow_config, sflow_state);
+        forward_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, sflow_config, sflow_state, sflow_input_queue, sflow_output_queue);
     }
 }
 
@@ -402,6 +527,8 @@ struct Cmd {
     int cpu_forwarding_cores[2] = {-1, -1}; // Support up to 2 cores for forwarding
     int cpu_return = -1;
     SFlowConfig sflow;
+    LogLevel log_level = LogLevel::WARN;  // Default to WARN
+    bool verbose = false;                 // Default to not verbose
 };
 
 static void print_usage(const char* prog) {
@@ -415,12 +542,13 @@ static void print_usage(const char* prog) {
         << "  --sample.ethertypes L   Comma-separated EtherTypes to sample (e.g. 0x800,0x86DD)\n"
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
         << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
-        << "\nEnvironment:\n"
-        << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + length)\n"
+        << "\nLogging:\n"
+        << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
+        << "  --verbose               Enable per-packet debug prints (EtherType + length)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
         << "  " << prog << " PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
-        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01\n";
+        << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01 --log-level INFO\n";
 }
 
 static bool parse_args(int argc, char** argv, Cmd& cmd) {
@@ -510,6 +638,27 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
                 std::cerr << "Failed to parse destination MAC address\n";
                 return false;
             }
+        } else if (option == "--log-level") {
+            std::string level_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (level_str.empty()) {
+                std::cerr << "Missing value for --log-level\n";
+                return false;
+            }
+            if (level_str == "DEBUG") {
+                cmd.log_level = LogLevel::DEBUG;
+            } else if (level_str == "INFO") {
+                cmd.log_level = LogLevel::INFO;
+            } else if (level_str == "WARN") {
+                cmd.log_level = LogLevel::WARN;
+            } else if (level_str == "ERROR") {
+                cmd.log_level = LogLevel::ERROR;
+            } else {
+                std::cerr << "Invalid log level: " << level_str << " (use DEBUG, INFO, WARN, ERROR)\n";
+                return false;
+            }
+        } else if (option == "--verbose") {
+            cmd.verbose = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -538,6 +687,10 @@ int main(int argc, char** argv) {
 
     const char* devA = cmd.devA;
     const char* devB = cmd.devB;
+
+    // Apply log level and verbose settings
+    set_log_level(cmd.log_level);
+    set_verbose_mode(cmd.verbose);
 
     std::cout << "S-Flow Packet Forwarder with AF_XDP\n";
     std::cout << "Device A: " << devA << "\n";
@@ -568,7 +721,7 @@ int main(int argc, char** argv) {
     const uint32_t TX_RESERVE  = 1024; // reserve frames per UMEM for TX freelist
 
     // Verbose per-packet prints toggle
-    const bool verbose = (std::getenv("BUMP_VERBOSE") != nullptr);
+    const bool verbose = g_verbose_mode;
 
     // --- Setup UMEMs ---
     UmemArea umemA {};
@@ -634,8 +787,37 @@ int main(int argc, char** argv) {
     
     LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional forwarding (multi-threaded)...");
 
-    // --- S-Flow state (only needed for A→B direction) ---
+    // --- S-Flow state and queues (only needed for A→B direction) ---
     SFlowState sflow_state_ab {};
+    ThreadSafeQueue<SFlowInputPacket> sflow_input_queue;
+    ThreadSafeQueue<std::unique_ptr<SFlowPacket>> sflow_output_queue;
+    
+    // Determine S-Flow processing CPU
+    int sflow_processing_cpu = -1; // no pinning by default
+    if (cmd.sflow.is_enabled()) {
+        if (cmd.cpu_forwarding_cores[1] >= 0) {
+            // Two cores specified: 2nd core for S-Flow processing
+            sflow_processing_cpu = cmd.cpu_forwarding_cores[1];
+            LOG(LogLevel::INFO, "S-Flow processing will use CPU %d (separate from forwarding)", sflow_processing_cpu);
+        } else if (cmd.cpu_forwarding_cores[0] >= 0) {
+            // One core specified: same core as forwarding
+            sflow_processing_cpu = cmd.cpu_forwarding_cores[0];
+            LOG(LogLevel::INFO, "S-Flow processing will use CPU %d (shared with forwarding)", sflow_processing_cpu);
+        }
+    }
+    
+    // --- Launch S-Flow processing thread (if enabled) ---
+    std::unique_ptr<std::thread> t_sflow_proc;
+    if (cmd.sflow.is_enabled()) {
+        t_sflow_proc = std::make_unique<std::thread>(
+            sflow_processing_worker, "A→B",
+            std::ref(sflow_input_queue),
+            std::ref(sflow_output_queue),
+            std::ref(cmd.sflow),
+            std::ref(sflow_state_ab),
+            std::ref(g_running),
+            sflow_processing_cpu);
+    }
     
     // --- Launch one worker thread per direction, with optional CPU pinning ---
     std::thread t_ab(
@@ -645,7 +827,9 @@ int main(int argc, char** argv) {
         &g_running, verbose,
         cmd.cpu_forwarding_cores[0], /* pin id or -1 */
         cmd.sflow.is_enabled() ? &cmd.sflow : nullptr,
-        cmd.sflow.is_enabled() ? &sflow_state_ab : nullptr);
+        cmd.sflow.is_enabled() ? &sflow_state_ab : nullptr,
+        cmd.sflow.is_enabled() ? &sflow_input_queue : nullptr,
+        cmd.sflow.is_enabled() ? &sflow_output_queue : nullptr);
 
     std::thread t_ba(
         forward_worker, "B→A",
@@ -654,11 +838,16 @@ int main(int argc, char** argv) {
         &g_running, verbose,
         cmd.cpu_return, /* pin id or -1 */
         nullptr, /* no S-Flow for B→A */
+        nullptr,
+        nullptr, /* no S-Flow queues for B→A */
         nullptr);
 
     // Wait for Ctrl-C
     t_ab.join();
     t_ba.join();
+    if (t_sflow_proc) {
+        t_sflow_proc->join();
+    }
 
     // Cleanup
     xsk_socket__delete(epB.xsk);

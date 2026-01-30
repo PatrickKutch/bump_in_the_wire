@@ -3,6 +3,10 @@
 // -----------------------------------------------------------------------------
 // Logging utilities implementation
 // -----------------------------------------------------------------------------
+// Global log level and verbose settings
+LogLevel g_log_level = LogLevel::WARN;  // Default to WARN
+bool g_verbose_mode = false;            // Default to not verbose
+
 const char* log_level_str(LogLevel level) {
     switch (level) {
         case LogLevel::DEBUG: return "DEBUG";
@@ -11,6 +15,14 @@ const char* log_level_str(LogLevel level) {
         case LogLevel::ERROR: return "ERROR";
         default: return "UNKNOWN";
     }
+}
+
+void set_log_level(LogLevel level) {
+    g_log_level = level;
+}
+
+void set_verbose_mode(bool verbose) {
+    g_verbose_mode = verbose;
 }
 
 std::string get_timestamp() {

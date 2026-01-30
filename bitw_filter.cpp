@@ -357,6 +357,8 @@ struct FilterCmd {
     int cpu_return = -1;
     std::vector<uint16_t> watermark_ethertypes;
     uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Default watermark MAC
+    LogLevel log_level = LogLevel::WARN;  // Default to WARN
+    bool verbose = false;                 // Default to not verbose
 };
 
 static void print_usage(const char* prog) {
@@ -372,13 +374,14 @@ static void print_usage(const char* prog) {
         << "                            If not specified, checks all packets\n"
         << "  --watermark.dest_mac MAC  Destination MAC for watermark detection (e.g. 02:00:00:00:00:01)\n"
         << "                            Only packets with this MAC will be checked for watermarks\n"
-        << "\nEnvironment:\n"
-        << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + action)\n"
+        << "\nLogging:\n"
+        << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
+        << "  --verbose               Enable per-packet debug prints (EtherType + action)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1\n"
         << "  " << prog << " PF0 PF1 --cpu.forwarding 2 --cpu.return 3\n"
         << "  " << prog << " PF0 PF1 --watermark.ethertypes=0x800,0x86DD\n"
-        << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01\n"
+        << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
         << "\nWatermark Detection:\n"
         << "  - Looks for TCP packets with non-zero Reserved bits\n"
         << "  - Expects 16-byte payload containing [hash:8][timestamp:8]\n"
@@ -445,6 +448,27 @@ static bool parse_args(int argc, char** argv, FilterCmd& cmd) {
                 std::cerr << "Failed to parse watermark destination MAC address\n";
                 return false;
             }
+        } else if (option == "--log-level") {
+            std::string level_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (level_str.empty()) {
+                std::cerr << "Missing value for --log-level\n";
+                return false;
+            }
+            if (level_str == "DEBUG") {
+                cmd.log_level = LogLevel::DEBUG;
+            } else if (level_str == "INFO") {
+                cmd.log_level = LogLevel::INFO;
+            } else if (level_str == "WARN") {
+                cmd.log_level = LogLevel::WARN;
+            } else if (level_str == "ERROR") {
+                cmd.log_level = LogLevel::ERROR;
+            } else {
+                std::cerr << "Invalid log level: " << level_str << " (use DEBUG, INFO, WARN, ERROR)\n";
+                return false;
+            }
+        } else if (option == "--verbose") {
+            cmd.verbose = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -466,6 +490,10 @@ int main(int argc, char** argv) {
 
     const char* devA = cmd.devA;
     const char* devB = cmd.devB;
+
+    // Apply log level and verbose settings
+    set_log_level(cmd.log_level);
+    set_verbose_mode(cmd.verbose);
 
     std::cout << "Watermark Packet Filter with AF_XDP\n";
     std::cout << "Device A: " << devA << "\n";
@@ -496,7 +524,7 @@ int main(int argc, char** argv) {
     const uint32_t TX_RESERVE  = 1024; // reserve frames per UMEM for TX freelist
 
     // Verbose per-packet prints toggle
-    const bool verbose = (std::getenv("BUMP_VERBOSE") != nullptr);
+    const bool verbose = g_verbose_mode;
 
     // --- Setup UMEMs ---
     UmemArea umemA {};
