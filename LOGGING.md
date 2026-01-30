@@ -58,7 +58,7 @@ sudo docker run --privileged --network=host --rm \
     -v /sys:/sys \
     -v /proc:/proc \
     -v /var/log/bitw_xdp:/app/logs \
-    bitw_xdp:docker-only PF0 PF1 --cpu-a 2 --cpu-b 3 2>&1 | tee /app/logs/bitw_xdp.log
+    bitw_xdp:docker-only PF0 PF1 --cpu.forwarding 2 --cpu.return 3 2>&1 | tee /app/logs/bitw_xdp.log
 ```
 
 **Pros:**

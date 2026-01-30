@@ -399,8 +399,8 @@ void forward_worker(const char* tag,
 struct Cmd {
     const char* devA = nullptr;
     const char* devB = nullptr;
-    int cpu_a = -1;
-    int cpu_b = -1;
+    int cpu_forwarding_cores[2] = {-1, -1}; // Support up to 2 cores for forwarding
+    int cpu_return = -1;
     SFlowConfig sflow;
 };
 
@@ -408,8 +408,8 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " <netdev_A> <netdev_B> [options]\n"
         << "\nCPU Pinning:\n"
-        << "  --cpu-a N               Pin A→B worker thread to CPU N\n"
-        << "  --cpu-b M               Pin B→A worker thread to CPU M\n"
+        << "  --cpu.forwarding N[,M]  Pin A→B worker thread to CPU N (optionally second core M)\n"
+        << "  --cpu.return M          Pin B→A worker thread to CPU M\n"
         << "\nS-Flow Sampling (A→B traffic only):\n"
         << "  --sample.sampling N     Sample 1 out of every N packets (0=disabled, e.g. 1000)\n"
         << "  --sample.ethertypes L   Comma-separated EtherTypes to sample (e.g. 0x800,0x86DD)\n"
@@ -418,7 +418,7 @@ static void print_usage(const char* prog) {
         << "\nEnvironment:\n"
         << "  BUMP_VERBOSE=1          Enable per-packet debug prints (EtherType + length)\n"
         << "\nExamples:\n"
-        << "  " << prog << " eth0 eth1 --cpu-a 2 --cpu-b 3\n"
+        << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
         << "  " << prog << " PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
         << "  " << prog << " PF0 PF1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01\n";
 }
@@ -436,22 +436,28 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
         std::string option = (eq_pos != std::string::npos) ? arg.substr(0, eq_pos) : arg;
         std::string value = (eq_pos != std::string::npos) ? arg.substr(eq_pos + 1) : "";
         
-        if (option == "--cpu-a") {
-            if (eq_pos != std::string::npos) {
-                cmd.cpu_a = std::atoi(value.c_str());
-            } else if (i + 1 < argc) {
-                cmd.cpu_a = std::atoi(argv[++i]);
-            } else {
-                std::cerr << "Missing value for --cpu-a\n";
+        if (option == "--cpu.forwarding") {
+            std::string cpu_str = (eq_pos != std::string::npos) ? value : 
+                                 (i + 1 < argc ? argv[++i] : "");
+            if (cpu_str.empty()) {
+                std::cerr << "Missing value for --cpu.forwarding\n";
                 return false;
             }
-        } else if (option == "--cpu-b") {
-            if (eq_pos != std::string::npos) {
-                cmd.cpu_b = std::atoi(value.c_str());
-            } else if (i + 1 < argc) {
-                cmd.cpu_b = std::atoi(argv[++i]);
+            // Parse comma-separated CPU cores (up to 2)
+            size_t comma_pos = cpu_str.find(',');
+            if (comma_pos != std::string::npos) {
+                cmd.cpu_forwarding_cores[0] = std::atoi(cpu_str.substr(0, comma_pos).c_str());
+                cmd.cpu_forwarding_cores[1] = std::atoi(cpu_str.substr(comma_pos + 1).c_str());
             } else {
-                std::cerr << "Missing value for --cpu-b\n";
+                cmd.cpu_forwarding_cores[0] = std::atoi(cpu_str.c_str());
+            }
+        } else if (option == "--cpu.return") {
+            if (eq_pos != std::string::npos) {
+                cmd.cpu_return = std::atoi(value.c_str());
+            } else if (i + 1 < argc) {
+                cmd.cpu_return = std::atoi(argv[++i]);
+            } else {
+                std::cerr << "Missing value for --cpu.return\n";
                 return false;
             }
         } else if (option == "--sample.sampling") {
@@ -536,8 +542,14 @@ int main(int argc, char** argv) {
     std::cout << "S-Flow Packet Forwarder with AF_XDP\n";
     std::cout << "Device A: " << devA << "\n";
     std::cout << "Device B: " << devB << "\n";
-    if (cmd.cpu_a >= 0) LOG(LogLevel::INFO, "Pin A→B thread to CPU %d", cmd.cpu_a);
-    if (cmd.cpu_b >= 0) LOG(LogLevel::INFO, "Pin B→A thread to CPU %d", cmd.cpu_b);
+    if (cmd.cpu_forwarding_cores[0] >= 0) {
+        if (cmd.cpu_forwarding_cores[1] >= 0) {
+            LOG(LogLevel::INFO, "Pin A→B thread to CPUs %d,%d", cmd.cpu_forwarding_cores[0], cmd.cpu_forwarding_cores[1]);
+        } else {
+            LOG(LogLevel::INFO, "Pin A→B thread to CPU %d", cmd.cpu_forwarding_cores[0]);
+        }
+    }
+    if (cmd.cpu_return >= 0) LOG(LogLevel::INFO, "Pin B→A thread to CPU %d", cmd.cpu_return);
 
     // Trap Ctrl-C for graceful shutdown
     std::signal(SIGINT,  handle_signal);
@@ -631,7 +643,7 @@ int main(int argc, char** argv) {
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_a, /* pin id or -1 */
+        cmd.cpu_forwarding_cores[0], /* pin id or -1 */
         cmd.sflow.is_enabled() ? &cmd.sflow : nullptr,
         cmd.sflow.is_enabled() ? &sflow_state_ab : nullptr);
 
@@ -640,7 +652,7 @@ int main(int argc, char** argv) {
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_b, /* pin id or -1 */
+        cmd.cpu_return, /* pin id or -1 */
         nullptr, /* no S-Flow for B→A */
         nullptr);
 

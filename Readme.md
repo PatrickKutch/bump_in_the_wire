@@ -66,12 +66,12 @@ sudo ip link show eth1
 ## Usage
 
 ```bash
-sudo ./bitw_xdp <netdev_A> <netdev_B> [--cpu-a N] [--cpu-b M]
+sudo ./bitw_xdp <netdev_A> <netdev_B> [--cpu.forwarding N[,M]] [--cpu.return M]
 ```
 
 ### Example
 ```bash
-sudo ./bitw_xdp eth0 eth1 --cpu-a 4 --cpu-b 8
+sudo ./bitw_xdp eth0 eth1 --cpu.forwarding 4 --cpu.return 8
 ```
 
 This will:
@@ -102,7 +102,7 @@ sudo ./run-container.sh PF0 PF1
 sudo ./run-container.sh --mode sflow PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800
 
 # Watermark filtering
-sudo ./run-container.sh --mode filter eth0 eth1 --cpu-a 4 --cpu-b 8 --watermark.ethertypes=0x800,0x86DD
+sudo ./run-container.sh --mode filter eth0 eth1 --cpu.forwarding 4 --cpu.return 8 --watermark.ethertypes=0x800,0x86DD
 
 # With verbose debugging
 sudo BUMP_VERBOSE=1 ./run-container.sh eth0 eth1
@@ -133,7 +133,7 @@ sudo docker run --privileged --network=host --rm \
 sudo docker run --privileged --network=host --rm \
     -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \
     -e BITW_MODE=filter \
-    bitw_xdp:docker-only eth0 eth1 --cpu-a 4 --cpu-b 8 --watermark.ethertypes=0x800,0x86DD
+    bitw_xdp:docker-only eth0 eth1 --cpu.forwarding 4 --cpu.return 8 --watermark.ethertypes=0x800,0x86DD
 ```
 
 ### Direct Podman Commands

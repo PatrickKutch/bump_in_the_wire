@@ -30,7 +30,7 @@ if [ $# -lt 2 ]; then
     echo "Examples:"
     echo "  sudo $0 PF0 PF1"
     echo "  sudo $0 --mode sflow PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800"
-    echo "  sudo $0 --mode filter PF0 PF1 --cpu-a 2"
+    echo "  sudo $0 --mode filter PF0 PF1 --cpu.forwarding 2"
     echo "  sudo BUMP_VERBOSE=1 $0 eth0 eth1"
     echo ""
     echo "Available interfaces:"

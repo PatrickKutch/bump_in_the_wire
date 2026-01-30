@@ -88,7 +88,7 @@ if [ $# -lt 2 ]; then\n\
     echo "  # Filter mode"\n\
     echo "  sudo docker run --privileged --network=host --rm -e BITW_MODE=filter <image> eth0 eth1"\n\
     echo "  # CPU pinning"\n\
-    echo "  sudo docker run --privileged --network=host --rm <image> eth0 eth1 --cpu-a 2 --cpu-b 4"\n\
+    echo "  sudo docker run --privileged --network=host --rm <image> eth0 eth1 --cpu.forwarding 2 --cpu.return 4"\n\
     echo ""\n\
     echo "Available interfaces:"\n\
     ip -o link show | awk -F": " "{print \\"  \\", \\$2}" | grep -v lo || echo "  (run with --network=host to see interfaces)"\n\
