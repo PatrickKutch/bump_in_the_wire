@@ -30,30 +30,11 @@ static bool is_watermarked_udp_packet(const PacketLayers& layers) {
 }
 
 // Main watermark detection dispatcher - calls appropriate protocol handler
-static bool is_watermarked_packet(const uint8_t* frame, uint32_t len, const PacketLayers& layers, 
-                                   const std::vector<uint16_t>& watermark_ethertypes) {
+// Since we now filter by magic MAC address, we only need to check protocol-specific watermarks
+static bool is_watermarked_packet(const uint8_t* frame, uint32_t len, const PacketLayers& layers) {
     if (!layers.valid) {
         LOG(LogLevel::ERROR, "Invalid packet layers for watermark detection");
         return false;
-    }
-    
-    // If EtherTypes are specified, only check packets matching those types
-    if (!watermark_ethertypes.empty()) {
-        uint16_t et = 0;
-        if (!get_ethertype(frame, len, et, false)) {
-            return false; // Can't determine EtherType
-        }
-        
-        bool ethertype_matches = false;
-        for (uint16_t target_et : watermark_ethertypes) {
-            if (et == target_et) {
-                ethertype_matches = true;
-                break;
-            }
-        }
-        if (!ethertype_matches) {
-            return false; // EtherType not in our filter list
-        }
     }
     
     switch (layers.l4_protocol) {
@@ -150,7 +131,6 @@ void filter_step(const char* tag,
                  XskEndpoint& in_ep, UmemArea& in_umem,
                  XskEndpoint& out_ep, UmemArea& out_umem,
                  bool debug_print = false,
-                 const std::vector<uint16_t>& watermark_ethertypes = {},
                  const uint8_t* watermark_dest_mac = nullptr)
 {
     static constexpr uint32_t BATCH = 64;
@@ -200,13 +180,13 @@ void filter_step(const char* tag,
             // This is a known limitation - AF_XDP intercepts all packets including PTP
             // Consider using separate interfaces for PTP and data traffic
             
-            // Check destination MAC address first - only process packets with matching MAC
+            // Check destination MAC address for magic MAC - only process packets with matching MAC
             if (watermark_dest_mac != nullptr && rx_lens[i] >= 6) {
                 bool mac_matches = std::memcmp(frame, watermark_dest_mac, 6) == 0;
                 if (mac_matches) {
-                    // Parse packet to check for watermark
+                    // Parse packet to check for watermark (magic MAC packets only)
                     PacketLayers layers = parse_packet_layers(frame, rx_lens[i]);
-                    if (layers.valid && is_watermarked_packet(frame, rx_lens[i], layers, watermark_ethertypes)) {
+                    if (layers.valid && is_watermarked_packet(frame, rx_lens[i], layers)) {
                         watermarked_packets++;
                         dropped_packets++;
                         forward_packet[i] = false; // Drop watermarked packet
@@ -214,18 +194,9 @@ void filter_step(const char* tag,
                         process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd);
                     }
                 }
-                // If MAC doesn't match, packet is forwarded normally (forward_packet[i] remains true)
-            } else {
-                // No MAC filter specified, check all packets for watermarks (original behavior)
-                PacketLayers layers = parse_packet_layers(frame, rx_lens[i]);
-                if (layers.valid && is_watermarked_packet(frame, rx_lens[i], layers, watermark_ethertypes)) {
-                    watermarked_packets++;
-                    dropped_packets++;
-                    forward_packet[i] = false; // Drop watermarked packet
-                    
-                    process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd);
-                }
+                // If MAC doesn't match magic MAC, packet is forwarded normally
             }
+            // Note: If no magic MAC is specified, no watermark filtering is performed
             
             // Debug: log EtherType per packet
             if (debug_print) {
@@ -323,7 +294,6 @@ void filter_worker(const char* tag,
                    std::atomic<bool>* running,
                    bool debug_print,
                    int cpu_pin,
-                   const std::vector<uint16_t>& watermark_ethertypes,
                    const uint8_t* watermark_dest_mac)
 {
     if (cpu_pin >= 0) {
@@ -343,7 +313,7 @@ void filter_worker(const char* tag,
             perror("poll");
             break;
         }
-        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_ethertypes, watermark_dest_mac);
+        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_dest_mac);
     }
 }
 
@@ -355,7 +325,6 @@ struct FilterCmd {
     const char* devB = nullptr;
     int cpu_forwarding_cores[2] = {-1, -1}; // Support up to 2 cores for forwarding
     int cpu_return = -1;
-    std::vector<uint16_t> watermark_ethertypes;
     uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Default watermark MAC
     LogLevel log_level = LogLevel::WARN;  // Default to WARN
     bool verbose = false;                 // Default to not verbose
@@ -370,17 +339,16 @@ static void print_usage(const char* prog) {
         << "  --cpu.forwarding N[,M]  Pin A→B worker thread to CPU N (optionally second core M)\n"
         << "  --cpu.return M          Pin B→A worker thread to CPU M\n"
         << "\nWatermark Filtering:\n"
-        << "  --watermark.ethertypes L  Comma-separated EtherTypes to check for watermarks (e.g. 0x800,0x86DD)\n"
-        << "                            If not specified, checks all packets\n"
-        << "  --watermark.dest_mac MAC  Destination MAC for watermark detection (e.g. 02:00:00:00:00:01)\n"
-        << "                            Only packets with this MAC will be checked for watermarks\n"
+        << "  --watermark.dest_mac MAC  Magic destination MAC for watermark detection (e.g. 02:00:00:00:00:01)\n"
+        << "                            Only packets with this magic MAC will be checked for watermarks\n"
+        << "                            (default: 02:00:00:00:00:01)\n"
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + action)\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1\n"
         << "  " << prog << " PF0 PF1 --cpu.forwarding 2 --cpu.return 3\n"
-        << "  " << prog << " PF0 PF1 --watermark.ethertypes=0x800,0x86DD\n"
+        << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01\n"
         << "  " << prog << " PF0 PF1 --watermark.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
         << "\nWatermark Detection:\n"
         << "  - Looks for TCP packets with non-zero Reserved bits\n"
@@ -424,17 +392,6 @@ static bool parse_args(int argc, char** argv, FilterCmd& cmd) {
                 cmd.cpu_return = std::atoi(argv[++i]);
             } else {
                 std::cerr << "Missing value for --cpu.return\n";
-                return false;
-            }
-        } else if (option == "--watermark.ethertypes") {
-            std::string types_str = (eq_pos != std::string::npos) ? value : 
-                                   (i + 1 < argc ? argv[++i] : "");
-            if (types_str.empty()) {
-                std::cerr << "Missing value for --watermark.ethertypes\n";
-                return false;
-            }
-            if (!parse_ethertypes(types_str.c_str(), cmd.watermark_ethertypes)) {
-                std::cerr << "Failed to parse EtherTypes\n";
                 return false;
             }
         } else if (option == "--watermark.dest_mac") {
@@ -573,17 +530,10 @@ int main(int argc, char** argv) {
     }
 
     LOG(LogLevel::INFO, "Watermark detection enabled for A→B traffic (TCP Reserved bits + hash+timestamp payload)");
-    LOG(LogLevel::INFO, "Watermark destination MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
+    LOG(LogLevel::INFO, "Watermark magic MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
         cmd.dest_mac[0], cmd.dest_mac[1], cmd.dest_mac[2],
         cmd.dest_mac[3], cmd.dest_mac[4], cmd.dest_mac[5]);
-    if (!cmd.watermark_ethertypes.empty()) {
-        std::stringstream ss;
-        for (size_t i = 0; i < cmd.watermark_ethertypes.size(); ++i) {
-            if (i > 0) ss << ", ";
-            ss << "0x" << std::hex << std::uppercase << cmd.watermark_ethertypes[i];
-        }
-        LOG(LogLevel::INFO, "Watermark EtherTypes: %s", ss.str().c_str());
-    }
+    LOG(LogLevel::INFO, "Only packets with magic MAC will be checked for watermarks");
     LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional filtering (multi-threaded)...");
     
     // --- Launch one worker thread per direction, with optional CPU pinning ---
@@ -592,14 +542,14 @@ int main(int argc, char** argv) {
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_forwarding_cores[0], cmd.watermark_ethertypes, cmd.dest_mac);
+        cmd.cpu_forwarding_cores[0], cmd.dest_mac);
 
     std::thread t_ba(
         filter_worker, "B→A",
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_return, cmd.watermark_ethertypes, cmd.dest_mac);
+        cmd.cpu_return, cmd.dest_mac);
 
     // Wait for Ctrl-C
     t_ab.join();
