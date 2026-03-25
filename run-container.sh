@@ -3,9 +3,33 @@
 
 set -e
 
+# Auto-detect container runtime (prefer podman, fallback to docker)
+if command -v podman >/dev/null 2>&1; then
+    CONTAINER_RUNTIME="podman"
+    CONTAINER_IMAGE="bitw_xdp:docker-only"
+elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_RUNTIME="docker"
+    CONTAINER_IMAGE="bitw_xdp:docker-only"
+else
+    echo "❌ Error: Neither podman nor docker is installed"
+    echo "   Please install either podman or docker to continue"
+    exit 1
+fi
+
 if [ "$EUID" -ne 0 ]; then
     echo "❌ Error: This script requires root privileges"
-    echo "   Run with: sudo $0"
+    echo "   AF_XDP operations need root access for:"
+    echo "   - Creating XDP sockets"
+    echo "   - Binding to network interfaces" 
+    echo "   - Accessing BPF filesystem"
+    echo ""
+    if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+        echo "   For podman: Run with sudo or as root user"
+        echo "   Example: sudo $0 $*"
+    else
+        echo "   For docker: Run with sudo"
+        echo "   Example: sudo $0 $*"
+    fi
     exit 1
 fi
 
@@ -20,6 +44,8 @@ fi
 if [ $# -lt 2 ]; then
     echo "🚀 bitw AF_XDP Container Runner"
     echo "==============================="
+    echo ""
+    echo "Container runtime: $CONTAINER_RUNTIME"
     echo ""
     echo "Usage: $0 [--mode sflow|filter] <interface_A> <interface_B> [additional_options]"
     echo ""
@@ -53,6 +79,7 @@ ip link set dev "$INTERFACE_A" xdp off 2>/dev/null || echo "  (no existing progr
 ip link set dev "$INTERFACE_B" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_B)"
 
 echo "🚀 Starting bitw_${PROGRAM_MODE} container..."
+echo "   Container runtime: $CONTAINER_RUNTIME"
 echo "   Mode: $PROGRAM_MODE"
 echo "   Forwarding: $INTERFACE_A ↔ $INTERFACE_B"
 if [ $# -gt 0 ]; then
@@ -60,14 +87,46 @@ if [ $# -gt 0 ]; then
 fi
 echo ""
 
-# Run the container with all required mounts and settings
-exec docker run \
-    --privileged \
-    --network=host \
-    --rm \
-    -v /sys/fs/bpf:/sys/fs/bpf \
-    -v /sys:/sys \
-    -v /proc:/proc \
-    -e BITW_MODE="$PROGRAM_MODE" \
-    bitw_xdp:docker-only \
-    "$INTERFACE_A" "$INTERFACE_B" "$@"
+# Run the container with all required mounts and settings  
+if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+    # For podman, check if image exists locally first
+    echo "Checking for local image..."
+    if ! $CONTAINER_RUNTIME images --format "{{.Repository}}:{{.Tag}}" | grep -q "bitw_xdp:docker-only"; then
+        echo "❌ Error: Container image not found in local storage"
+        echo ""
+        echo "The image needs to be loaded into root's podman storage."
+        echo "Please run as root:"
+        echo "  1. Load the image: gunzip -c /tmp/bitw_xdp-docker-only.tar.gz | podman load"
+        echo "  2. Or copy from user storage: podman save docker.io/library/bitw_xdp:docker-only | podman load --input -"
+        echo ""
+        echo "Available images in current storage:"
+        $CONTAINER_RUNTIME images | grep -E "(REPOSITORY|bitw_xdp)" || echo "  (none found)"
+        exit 1
+    fi
+    
+    # Use the full registry path as it appears in podman images
+    echo "Running podman as root for AF_XDP privileged operations..."
+    echo "Container: docker.io/library/bitw_xdp:docker-only"
+    exec $CONTAINER_RUNTIME run \
+        --privileged \
+        --network=host \
+        --rm \
+        -v /sys/fs/bpf:/sys/fs/bpf \
+        -v /sys:/sys \
+        -v /proc:/proc \
+        -e BITW_MODE="$PROGRAM_MODE" \
+        docker.io/library/bitw_xdp:docker-only \
+        "$INTERFACE_A" "$INTERFACE_B" "$@"
+else
+    # For docker, use standard approach
+    exec $CONTAINER_RUNTIME run \
+        --privileged \
+        --network=host \
+        --rm \
+        -v /sys/fs/bpf:/sys/fs/bpf \
+        -v /sys:/sys \
+        -v /proc:/proc \
+        -e BITW_MODE="$PROGRAM_MODE" \
+        $CONTAINER_IMAGE \
+        "$INTERFACE_A" "$INTERFACE_B" "$@"
+fi

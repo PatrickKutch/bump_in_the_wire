@@ -769,8 +769,17 @@ int main(int argc, char** argv) {
         LOG(LogLevel::INFO, "Prefilled %u RX frames for %s", n, devB);
     }
 
-    // --- S-Flow configuration logging ---
+    LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional forwarding (multi-threaded)...");
+
+    // --- S-Flow initialization (if enabled) ---
+    SFlowState sflow_state_ab {};
+    ThreadSafeQueue<SFlowInputPacket> sflow_input_queue;
+    ThreadSafeQueue<std::unique_ptr<SFlowPacket>> sflow_output_queue;
+    int sflow_processing_cpu = -1; // no pinning by default
+    std::unique_ptr<std::thread> t_sflow_proc;
+    
     if (cmd.sflow.is_enabled()) {
+        // S-Flow configuration logging
         LOG(LogLevel::INFO, "S-Flow sampling enabled for A→B traffic:");
         LOG(LogLevel::INFO, "  - Sampling rate: 1 in %u packets", cmd.sflow.sampling_rate);
         LOG(LogLevel::INFO, "  - Skip VLAN tags: %s", cmd.sflow.skip_vlan ? "true" : "false");
@@ -783,18 +792,8 @@ int main(int argc, char** argv) {
             ss << "0x" << std::hex << std::uppercase << cmd.sflow.ethertypes[i];
         }
         LOG(LogLevel::INFO, "  - EtherTypes: %s", ss.str().c_str());
-    }
-    
-    LOG(LogLevel::INFO, "Sockets created and rings mapped. Starting bidirectional forwarding (multi-threaded)...");
-
-    // --- S-Flow state and queues (only needed for A→B direction) ---
-    SFlowState sflow_state_ab {};
-    ThreadSafeQueue<SFlowInputPacket> sflow_input_queue;
-    ThreadSafeQueue<std::unique_ptr<SFlowPacket>> sflow_output_queue;
-    
-    // Determine S-Flow processing CPU
-    int sflow_processing_cpu = -1; // no pinning by default
-    if (cmd.sflow.is_enabled()) {
+        
+        // Determine S-Flow processing CPU
         if (cmd.cpu_forwarding_cores[1] >= 0) {
             // Two cores specified: 2nd core for S-Flow processing
             sflow_processing_cpu = cmd.cpu_forwarding_cores[1];
@@ -804,11 +803,8 @@ int main(int argc, char** argv) {
             sflow_processing_cpu = cmd.cpu_forwarding_cores[0];
             LOG(LogLevel::INFO, "S-Flow processing will use CPU %d (shared with forwarding)", sflow_processing_cpu);
         }
-    }
-    
-    // --- Launch S-Flow processing thread (if enabled) ---
-    std::unique_ptr<std::thread> t_sflow_proc;
-    if (cmd.sflow.is_enabled()) {
+        
+        // Launch S-Flow processing thread
         t_sflow_proc = std::make_unique<std::thread>(
             sflow_processing_worker, "A→B",
             std::ref(sflow_input_queue),
