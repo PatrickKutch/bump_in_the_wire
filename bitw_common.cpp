@@ -533,7 +533,24 @@ int create_xsk_with_fallback(const char* ifname,
     using_zerocopy = false;
     using_skb_mode = false;
 
-    // 1) DRV + ZEROCOPY
+    // For igc driver compatibility, try SKB mode first if allowed
+    // (igc has known issues with DRV mode AF_XDP)
+    
+    // 1) SKB + COPY (works best with igc driver) - if fallback allowed
+    if (allow_skb_fallback) {
+        struct xsk_socket_config cfg = base_cfg;
+        cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
+        cfg.bind_flags = 0;
+        if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
+            LOG(LogLevel::INFO, "[%s] bound: SKB + COPY (igc compat) ✅", ifname);
+            using_zerocopy = false;
+            using_skb_mode = true;
+            return 0;
+        }
+        LOG(LogLevel::WARN, "[%s] SKB + COPY bind failed, trying DRV modes...", ifname);
+    }
+
+    // 2) DRV + ZEROCOPY (fallback for other drivers)
     {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
@@ -547,7 +564,7 @@ int create_xsk_with_fallback(const char* ifname,
         LOG(LogLevel::WARN, "[%s] DRV + ZEROCOPY bind failed, will try DRV + COPY...", ifname);
     }
 
-    // 2) DRV + COPY (bind_flags=0)
+    // 3) DRV + COPY (bind_flags=0)
     {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
@@ -558,29 +575,15 @@ int create_xsk_with_fallback(const char* ifname,
             using_skb_mode = false;
             return 0;
         }
-        LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed%s", ifname, 
-            allow_skb_fallback ? ", will try SKB + COPY..." : "");
+        LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed", ifname);
     }
 
     if (!allow_skb_fallback) {
-        std::fprintf(stderr, "[%s] no SKB fallback allowed; giving up.\n", ifname);
+        LOG(LogLevel::ERROR, "[%s] SKB fallback not allowed; giving up.", ifname);
         return 1;
     }
 
-    // 3) SKB + COPY (bind_flags=0)
-    {
-        struct xsk_socket_config cfg = base_cfg;
-        cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
-        cfg.bind_flags = 0;
-        if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            LOG(LogLevel::INFO, "[%s] bound: SKB + COPY (fallback) ✅", ifname);
-            using_zerocopy = false;
-            using_skb_mode = true;
-            return 0;
-        }
-        LOG(LogLevel::ERROR, "[%s] SKB + COPY bind failed; giving up.", ifname);
-    }
-
+    LOG(LogLevel::ERROR, "[%s] All bind attempts failed; giving up.", ifname);
     return 1;
 }
 

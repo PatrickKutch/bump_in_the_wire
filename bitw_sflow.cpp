@@ -291,9 +291,20 @@ void forward_step(const char* tag,
     // 2) Peek RX packets on input
     uint32_t rx_idx = 0;
     unsigned int rcvd = xsk_ring_cons__peek(&in_ep.rx, BATCH, &rx_idx);
+    
+    // Debug: Show polling activity periodically
+    static uint64_t poll_count = 0;
+    poll_count++;
+    if (poll_count % 10000 == 0) { // Every ~10K polls instead of 1M
+        LOG(LogLevel::DEBUG, "[%s] Polling heartbeat... (poll #%lu, rcvd=%u)", tag, poll_count, rcvd);
+    }
+    
     if (rcvd == 0) {
         return; // nothing to receive now
     }
+    
+    // Debug: Always log when we actually receive packets
+    LOG(LogLevel::DEBUG, "[%s] *** RECEIVED %u packets! ***", tag, rcvd);
 
     // Stash RX descriptors (addr,len)
     uint64_t rx_addrs[BATCH];
@@ -502,17 +513,33 @@ void forward_worker(const char* tag,
             LOG(LogLevel::INFO, "[%s] pinned to CPU %d", tag, cpu_pin);
         }
     }
+    
+    LOG(LogLevel::INFO, "[%s] Starting packet forwarding main loop", tag);
+    
+    // Add immediate debug message to confirm loop entry
+    LOG(LogLevel::DEBUG, "[%s] Entering main poll loop...", tag);
 
     struct pollfd pfd;
     pfd.fd = in_ep->fd;
     pfd.events = POLLIN;
 
     while (running->load(std::memory_order_relaxed)) {
-        int pr = poll(&pfd, 1, 100 /*ms*/);
+        int pr = poll(&pfd, 1, 1000 /*ms*/); // Increased timeout for more visible polling
         if (pr < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
+        }
+        
+        // Debug: Always log poll results when in DEBUG mode
+        static int poll_count = 0;
+        poll_count++;
+        if (debug_print && (poll_count % 10 == 0 || pr > 0)) {
+            LOG(LogLevel::DEBUG, "[%s] poll() count=%d result=%d (0=timeout, >0=activity)", tag, poll_count, pr);
+        }
+        
+        if (pr > 0 && debug_print) {
+            LOG(LogLevel::DEBUG, "[%s] poll() detected activity (pr=%d)", tag, pr);
         }
         forward_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, sflow_config, sflow_state, sflow_input_queue, sflow_output_queue);
     }
