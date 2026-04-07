@@ -520,6 +520,27 @@ int create_xsk_socket(const char* ifname,
     return 0;
 }
 
+// Force copy mode only (for I226 igc driver compatibility)
+int create_xsk_copy_mode_only(const char* ifname,
+                              XskEndpoint& ep,
+                              UmemArea& ua,
+                              const struct xsk_socket_config& base_cfg,
+                              uint32_t queue_id)
+{
+    // Only try DRV + COPY mode (no zerocopy, no SKB fallback)
+    struct xsk_socket_config cfg = base_cfg;
+    cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
+    cfg.bind_flags = 0; // Force copy mode
+    
+    if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
+        LOG(LogLevel::INFO, "[%s] bound: DRV + COPY (I226 optimized) ✅", ifname);
+        return 0;
+    }
+    
+    LOG(LogLevel::ERROR, "[%s] DRV + COPY bind failed", ifname);
+    return 1;
+}
+
 // Try: DRV+ZEROCOPY -> DRV+COPY -> (optional) SKB+COPY
 int create_xsk_with_fallback(const char* ifname,
                              XskEndpoint& ep,
@@ -533,24 +554,10 @@ int create_xsk_with_fallback(const char* ifname,
     using_zerocopy = false;
     using_skb_mode = false;
 
-    // For igc driver compatibility, try SKB mode first if allowed
-    // (igc has known issues with DRV mode AF_XDP)
+    // For igc driver: try DRV mode first (TX works better), fallback to SKB for RX compatibility
+    // This is a hybrid approach for igc driver issues
     
-    // 1) SKB + COPY (works best with igc driver) - if fallback allowed
-    if (allow_skb_fallback) {
-        struct xsk_socket_config cfg = base_cfg;
-        cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
-        cfg.bind_flags = 0;
-        if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            LOG(LogLevel::INFO, "[%s] bound: SKB + COPY (igc compat) ✅", ifname);
-            using_zerocopy = false;
-            using_skb_mode = true;
-            return 0;
-        }
-        LOG(LogLevel::WARN, "[%s] SKB + COPY bind failed, trying DRV modes...", ifname);
-    }
-
-    // 2) DRV + ZEROCOPY (fallback for other drivers)
+    // 1) DRV + ZEROCOPY (best performance, may work for TX even if RX has issues)
     {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
@@ -564,18 +571,32 @@ int create_xsk_with_fallback(const char* ifname,
         LOG(LogLevel::WARN, "[%s] DRV + ZEROCOPY bind failed, will try DRV + COPY...", ifname);
     }
 
-    // 3) DRV + COPY (bind_flags=0)
+    // 2) DRV + COPY (may fix igc TX issues compared to SKB mode)
     {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
         cfg.bind_flags = 0;
         if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            LOG(LogLevel::INFO, "[%s] bound: DRV + COPY (no zerocopy) ✅", ifname);
+            LOG(LogLevel::INFO, "[%s] bound: DRV + COPY ✅", ifname);
             using_zerocopy = false;
             using_skb_mode = false;
             return 0;
         }
-        LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed", ifname);
+        LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed, will try SKB...", ifname);
+    }
+
+    // 3) SKB + COPY (fallback - RX works but TX broken on igc)
+    if (allow_skb_fallback) {
+        struct xsk_socket_config cfg = base_cfg;
+        cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
+        cfg.bind_flags = 0;
+        if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
+            LOG(LogLevel::WARN, "[%s] bound: SKB + COPY (TX may not work on igc) ⚠️", ifname);
+            using_zerocopy = false;
+            using_skb_mode = true;
+            return 0;
+        }
+        LOG(LogLevel::WARN, "[%s] SKB + COPY bind failed", ifname);
     }
 
     if (!allow_skb_fallback) {

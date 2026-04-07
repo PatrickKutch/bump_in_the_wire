@@ -122,7 +122,7 @@ static bool is_watermarked_packet(const uint8_t* frame, uint32_t len, const Pack
 }
 
 // Process a detected watermarked packet
-static void process_watermarked_packet(const char* tag, const PacketLayers& layers, uint32_t len, int sockfd) {
+static void process_watermarked_packet(const char* tag, const PacketLayers& layers, uint32_t len, int sockfd, bool use_hw_timestamp) {
     // Debug: Show raw payload bytes
     // LOG(LogLevel::DEBUG, "Raw payload (%u bytes): %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X %02X %02X %02X %02X",
     //     layers.l4_payload_len,
@@ -146,20 +146,30 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
     uint8_t tcp_flags_byte = layers.l4_header[12];
     uint8_t reserved_bits = (tcp_flags_byte >> 4) & 0x0F;
     
-    // Get current timestamp for latency measurement (same approach as sflow)
+    // Get current timestamp for latency measurement based on configuration
     uint64_t rx_timestamp_ns = 0;
     bool has_timestamp = false;
     bool is_hw_timestamp = false;
     
-    // First try to get hardware timestamp from PTP hardware clock
-    if (get_ptp_hw_timestamp(rx_timestamp_ns)) {
-        has_timestamp = true;
-        is_hw_timestamp = true;
-    } else if (extract_hw_timestamp(sockfd, rx_timestamp_ns)) {
-        has_timestamp = true;
-        is_hw_timestamp = true;
+    if (use_hw_timestamp) {
+        // Try hardware timestamp first if enabled
+        if (get_ptp_hw_timestamp(rx_timestamp_ns)) {
+            has_timestamp = true;
+            is_hw_timestamp = true;
+        } else if (extract_hw_timestamp(sockfd, rx_timestamp_ns)) {
+            has_timestamp = true;
+            is_hw_timestamp = true;
+        } else {
+            // Fallback to system clock if hardware timestamp not available
+            struct timespec ts;
+            if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+                rx_timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+                has_timestamp = true;
+                is_hw_timestamp = false;
+            }
+        }
     } else {
-        // Fallback to system clock if hardware timestamp not available
+        // Use system clock directly when hardware timestamp disabled
         struct timespec ts;
         if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
             rx_timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
@@ -201,7 +211,8 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
 void watermark_processing_worker(const char* tag,
                                ThreadSafeQueue<WatermarkedPacket>& input_queue,
                                std::atomic<bool>& running,
-                               int cpu_pin) {
+                               int cpu_pin,
+                               bool use_hw_timestamp) {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
             LOG(LogLevel::INFO, "[%s WMARK-PROC] pinned to CPU %d", tag, cpu_pin);
@@ -218,7 +229,7 @@ void watermark_processing_worker(const char* tag,
             // Process the watermarked packet
             process_watermarked_packet(tag, watermarked_packet.layers, 
                                      watermarked_packet.length, 
-                                     watermarked_packet.socket_fd);
+                                     watermarked_packet.socket_fd, use_hw_timestamp);
         }
     }
 
@@ -233,7 +244,8 @@ void filter_step(const char* tag,
                  XskEndpoint& out_ep, UmemArea& out_umem,
                  bool debug_print = false,
                  const uint8_t* watermark_dest_mac = nullptr,
-                 ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr)
+                 ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr,
+                 bool use_hw_timestamp = false)
 {
     static constexpr uint32_t BATCH = 64;
     static uint32_t total_packets = 0;
@@ -299,7 +311,7 @@ void filter_step(const char* tag,
                             watermark_queue->push(std::move(watermarked_pkt));
                         } else {
                             // Fallback to direct processing if no queue provided
-                            process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd);
+                            process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd, use_hw_timestamp);
                         }
                     }
                 }
@@ -404,7 +416,8 @@ void filter_worker(const char* tag,
                    bool debug_print,
                    int cpu_pin,
                    const uint8_t* watermark_dest_mac,
-                   ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr)
+                   ThreadSafeQueue<WatermarkedPacket>* watermark_queue = nullptr,
+                   bool use_hw_timestamp = false)
 {
     if (cpu_pin >= 0) {
         if (pin_current_thread_to_cpu(cpu_pin) == 0) {
@@ -423,7 +436,7 @@ void filter_worker(const char* tag,
             perror("poll");
             break;
         }
-        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_dest_mac, watermark_queue);
+        filter_step(tag, *in_ep, *in_umem, *out_ep, *out_umem, debug_print, watermark_dest_mac, watermark_queue, use_hw_timestamp);
     }
 }
 
@@ -436,6 +449,7 @@ struct FilterCmd {
     int cpu_forwarding_cores[2] = {-1, -1}; // Support up to 2 cores for forwarding
     int cpu_return = -1;
     uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Default watermark MAC
+    bool use_hw_timestamp = false; // false = use system clock, true = try hardware timestamp
     LogLevel log_level = LogLevel::WARN;  // Default to WARN
     bool verbose = false;                 // Default to not verbose
 };
@@ -452,6 +466,7 @@ static void print_usage(const char* prog) {
         << "  --watermark.dest_mac MAC  Magic destination MAC for watermark detection (e.g. 02:00:00:00:00:01)\n"
         << "                            Only packets with this magic MAC will be checked for watermarks\n"
         << "                            (default: 02:00:00:00:00:01)\n"
+        << "  --watermark.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + action)\n"
@@ -514,8 +529,21 @@ static bool parse_args(int argc, char** argv, FilterCmd& cmd) {
             if (!parse_mac_address(mac_str.c_str(), cmd.dest_mac)) {
                 std::cerr << "Failed to parse watermark destination MAC address\n";
                 return false;
+            }        } else if (option == "--watermark.hw_timestamp") {
+            std::string hw_ts_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (hw_ts_str.empty()) {
+                std::cerr << "Missing value for --watermark.hw_timestamp\n";
+                return false;
             }
-        } else if (option == "--log-level") {
+            if (hw_ts_str == "true" || hw_ts_str == "1") {
+                cmd.use_hw_timestamp = true;
+            } else if (hw_ts_str == "false" || hw_ts_str == "0") {
+                cmd.use_hw_timestamp = false;
+            } else {
+                std::cerr << "Invalid hw_timestamp value: " << hw_ts_str << " (use true/false)\n";
+                return false;
+            }        } else if (option == "--log-level") {
             std::string level_str = (eq_pos != std::string::npos) ? value : 
                                    (i + 1 < argc ? argv[++i] : "");
             if (level_str.empty()) {
@@ -585,9 +613,9 @@ int main(int argc, char** argv) {
     base_cfg.libbpf_flags = 0;
 
     // Parameters
-    const uint32_t FRAME_COUNT = 8192; // tune as needed
-    const uint32_t FRAME_SIZE  = 2048; // must hold your MTU (1500 -> OK)
-    const uint32_t HEADROOM    = 0;
+    const uint32_t FRAME_COUNT = 4096; // tune as needed (reduced because frames are bigger)
+    const uint32_t FRAME_SIZE  = 4096; // I226 requires better alignment - power of 2
+    const uint32_t HEADROOM    = 256;  // I226 needs more headroom for metadata
     const uint32_t TX_RESERVE  = 1024; // reserve frames per UMEM for TX freelist
 
     // Verbose per-packet prints toggle
@@ -640,6 +668,7 @@ int main(int argc, char** argv) {
     }
 
     LOG(LogLevel::INFO, "Watermark detection enabled for A→B traffic (TCP Reserved bits + hash+timestamp payload)");
+    LOG(LogLevel::INFO, "Hardware timestamp: %s", cmd.use_hw_timestamp ? "enabled" : "disabled (using system clock)");
     LOG(LogLevel::INFO, "Watermark magic MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
         cmd.dest_mac[0], cmd.dest_mac[1], cmd.dest_mac[2],
         cmd.dest_mac[3], cmd.dest_mac[4], cmd.dest_mac[5]);
@@ -666,7 +695,8 @@ int main(int argc, char** argv) {
         watermark_processing_worker, "A→B",
         std::ref(watermark_queue),
         std::ref(g_running),
-        watermark_processing_cpu);
+        watermark_processing_cpu,
+        cmd.use_hw_timestamp);
     
     // --- Launch one worker thread per direction, with optional CPU pinning ---
     std::thread t_ab(
@@ -674,14 +704,14 @@ int main(int argc, char** argv) {
         &epA, &umemA,
         &epB, &umemB,
         &g_running, verbose,
-        cmd.cpu_forwarding_cores[0], cmd.dest_mac, &watermark_queue);
+        cmd.cpu_forwarding_cores[0], cmd.dest_mac, &watermark_queue, cmd.use_hw_timestamp);
 
     std::thread t_ba(
         filter_worker, "B→A",
         &epB, &umemB,
         &epA, &umemA,
         &g_running, verbose,
-        cmd.cpu_return, cmd.dest_mac, nullptr); // No watermark processing for B→A
+        cmd.cpu_return, cmd.dest_mac, nullptr, cmd.use_hw_timestamp); // No watermark processing for B→A
 
     // Wait for Ctrl-C
     t_ab.join();

@@ -6,7 +6,7 @@ LIBS = -lxdp -lbpf -pthread
 COMMON_OBJS = bitw_common.o
 
 # Program targets
-PROGRAMS = bitw_sflow bitw_filter
+PROGRAMS = bitw_sflow bitw_filter afx_tx
 
 .PHONY: all clean
 
@@ -22,6 +22,10 @@ bitw_sflow: bitw_sflow.cpp $(COMMON_OBJS)
 
 # Filter program  
 bitw_filter: bitw_filter.cpp $(COMMON_OBJS)
+	$(CXX) $(CXXFLAGS) $< $(COMMON_OBJS) -o $@ $(LIBS)
+
+# Standalone AF_XDP TX test program (now uses bitw_common)
+afx_tx: afx_tx.cpp $(COMMON_OBJS)
 	$(CXX) $(CXXFLAGS) $< $(COMMON_OBJS) -o $@ $(LIBS)
 
 clean:

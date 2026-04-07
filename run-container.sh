@@ -41,7 +41,35 @@ if [ "$1" = "--mode" ] && [ $# -ge 2 ]; then
     shift 2
 fi
 
-if [ $# -lt 2 ]; then
+# Validate arguments based on mode
+if [ "$PROGRAM_MODE" = "afx_tx" ]; then
+    if [ $# -lt 3 ]; then
+        echo "🚀 bitw AF_XDP Container Runner"
+        echo "==============================="
+        echo ""
+        echo "Container runtime: $CONTAINER_RUNTIME"
+        echo ""
+        echo "Usage (afx_tx mode): $0 --mode afx_tx <interface> <dest_mac> <interval_ms> [additional_options]"
+        echo ""
+        echo "AFX_TX Mode - Standalone AF_XDP TX Test Program:"
+        echo "  <interface>   Network interface (e.g., eth0)"
+        echo "  <dest_mac>    Destination MAC address (e.g., aa:bb:cc:dd:ee:ff)"
+        echo "  <interval_ms> Packet transmission interval in milliseconds"
+        echo ""
+        echo "Options:"
+        echo "  --i226-mode   Use I226-optimized AF_XDP settings"
+        echo "  --verbose     Enable verbose packet logging"
+        echo ""
+        echo "Examples:"
+        echo "  sudo $0 --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000"
+        echo "  sudo $0 --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 500 --i226-mode --verbose"
+        echo ""
+        echo "Available interfaces:"
+        ip -o link show | awk -F': ' '{print "  ", $2}' | grep -v lo
+        echo ""
+        exit 1
+    fi
+elif [ $# -lt 2 ]; then
     echo "🚀 bitw AF_XDP Container Runner"
     echo "==============================="
     echo ""
@@ -52,11 +80,13 @@ if [ $# -lt 2 ]; then
     echo "Modes:"
     echo "  sflow   - S-Flow sampling with TCP watermarking (default)"
     echo "  filter  - Watermark detection and filtering"
+    echo "  afx_tx  - Standalone AF_XDP TX test program"
     echo ""
     echo "Examples:"
     echo "  sudo $0 PF0 PF1"
     echo "  sudo $0 --mode sflow PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800"
     echo "  sudo $0 --mode filter PF0 PF1 --cpu.forwarding 2"
+    echo "  sudo $0 --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000 --i226-mode"
     echo "  sudo BUMP_VERBOSE=1 $0 eth0 eth1"
     echo ""
     echo "Available interfaces:"
@@ -65,23 +95,35 @@ if [ $# -lt 2 ]; then
     exit 1
 fi
 
-if [ "$PROGRAM_MODE" != "sflow" ] && [ "$PROGRAM_MODE" != "filter" ]; then
-    echo "❌ Error: Invalid mode '$PROGRAM_MODE'. Use 'sflow' or 'filter'"
+if [ "$PROGRAM_MODE" != "sflow" ] && [ "$PROGRAM_MODE" != "filter" ] && [ "$PROGRAM_MODE" != "afx_tx" ]; then
+    echo "❌ Error: Invalid mode '$PROGRAM_MODE'. Use 'sflow', 'filter', or 'afx_tx'"
     exit 1
 fi
 
 INTERFACE_A=$1
-INTERFACE_B=$2
-shift 2
-
-echo "🔧 Cleaning up any existing XDP programs..."
-ip link set dev "$INTERFACE_A" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_A)"
-ip link set dev "$INTERFACE_B" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_B)"
+if [ "$PROGRAM_MODE" != "afx_tx" ]; then
+    INTERFACE_B=$2
+    shift 2
+    
+    echo "🔧 Cleaning up any existing XDP programs..."
+    ip link set dev "$INTERFACE_A" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_A)"
+    ip link set dev "$INTERFACE_B" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_B)"
+else
+    # For afx_tx mode, we only need the first interface
+    shift 1
+    
+    echo "🔧 Cleaning up any existing XDP programs..."
+    ip link set dev "$INTERFACE_A" xdp off 2>/dev/null || echo "  (no existing program on $INTERFACE_A)"
+fi
 
 echo "🚀 Starting bitw_${PROGRAM_MODE} container..."
 echo "   Container runtime: $CONTAINER_RUNTIME"
 echo "   Mode: $PROGRAM_MODE"
-echo "   Forwarding: $INTERFACE_A ↔ $INTERFACE_B"
+if [ "$PROGRAM_MODE" = "afx_tx" ]; then
+    echo "   Interface: $INTERFACE_A"
+else
+    echo "   Forwarding: $INTERFACE_A ↔ $INTERFACE_B"
+fi
 if [ $# -gt 0 ]; then
     echo "   Additional options: $*"
 fi
@@ -116,7 +158,7 @@ if [ "$CONTAINER_RUNTIME" = "podman" ]; then
         -v /proc:/proc \
         -e BITW_MODE="$PROGRAM_MODE" \
         docker.io/library/bitw_xdp:docker-only \
-        "$INTERFACE_A" "$INTERFACE_B" "$@"
+        $(if [ "$PROGRAM_MODE" != "afx_tx" ]; then echo "$INTERFACE_A" "$INTERFACE_B" "$@"; else echo "$INTERFACE_A" "$@"; fi)
 else
     # For docker, use standard approach
     exec $CONTAINER_RUNTIME run \
@@ -128,5 +170,5 @@ else
         -v /proc:/proc \
         -e BITW_MODE="$PROGRAM_MODE" \
         $CONTAINER_IMAGE \
-        "$INTERFACE_A" "$INTERFACE_B" "$@"
+        $(if [ "$PROGRAM_MODE" != "afx_tx" ]; then echo "$INTERFACE_A" "$INTERFACE_B" "$@"; else echo "$INTERFACE_A" "$@"; fi)
 fi

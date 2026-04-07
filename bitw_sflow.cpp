@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
 
 // -----------------------------------------------------------------------------
 // Thread-safe queue template
@@ -274,17 +275,65 @@ void forward_step(const char* tag,
                   ThreadSafeQueue<std::unique_ptr<SFlowPacket>>* sflow_output_queue = nullptr)
 {
     static constexpr uint32_t BATCH = 64;
+    
+    // Static variable for IGC driver workaround - track pending TX frames
+    static std::vector<uint64_t> pending_tx_addrs;
 
-    // 1) Reap TX completions on output UMEM (recycle TX frames)
+    // 1) Reap TX completions on output UMEM (recycle TX frames) - try multiple times for igc
+    int completion_attempts = 0;
     {
         uint32_t c_idx = 0;
-        unsigned int ncomp = xsk_ring_cons__peek(&out_umem.comp, BATCH, &c_idx);
-        if (ncomp) {
-            for (unsigned int i = 0; i < ncomp; ++i) {
-                uint64_t done_addr = *xsk_ring_cons__comp_addr(&out_umem.comp, c_idx + i);
-                free_frame(out_umem, done_addr);
+        unsigned int total_completions = 0;
+        
+        // Try up to 3 times to get completions (igc driver workaround)
+        for (int attempt = 0; attempt < 3; attempt++) { 
+            unsigned int ncomp = xsk_ring_cons__peek(&out_umem.comp, BATCH, &c_idx);
+            if (ncomp) {
+                for (unsigned int i = 0; i < ncomp; ++i) {
+                    uint64_t done_addr = *xsk_ring_cons__comp_addr(&out_umem.comp, c_idx + i);
+                    free_frame(out_umem, done_addr);
+                }
+                xsk_ring_cons__release(&out_umem.comp, ncomp);
+                total_completions += ncomp;
             }
-            xsk_ring_cons__release(&out_umem.comp, ncomp);
+            completion_attempts++;
+            if (ncomp == 0 && attempt < 2) {
+                // Force a small delay and try again (igc driver may be slow)
+                usleep(100); // 100 microseconds
+            }
+        }
+        
+        if (total_completions > 0 && debug_print) {
+            LOG(LogLevel::DEBUG, "[%s] TX completions: %u frames recycled (attempts=%d)", 
+                tag, total_completions, completion_attempts);
+        } else if (debug_print && completion_attempts > 1) {
+            LOG(LogLevel::DEBUG, "[%s] TX completions: 0 frames after %d attempts", 
+                tag, completion_attempts);
+        }
+        
+        // IGC driver SKB mode workaround: manual frame recycling
+        // If we have very few frames left and no completions, assume they're stuck
+        static uint64_t last_recycling_attempt = 0;
+        
+        if (out_umem.free_frames.size() < 100 && total_completions == 0) {
+            uint64_t current_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+                
+            if (current_time - last_recycling_attempt > 100) { // Every 100ms
+                // Emergency frame recycling - recycle some of the oldest pending frames
+                size_t to_recycle = std::min(pending_tx_addrs.size(), (size_t)100);
+                for (size_t i = 0; i < to_recycle; i++) {
+                    out_umem.free_frames.push_back(pending_tx_addrs[i]);
+                }
+                if (to_recycle > 0) {
+                    pending_tx_addrs.erase(pending_tx_addrs.begin(), pending_tx_addrs.begin() + to_recycle);
+                    if (debug_print) {
+                        LOG(LogLevel::WARN, "[%s] IGC workaround: emergency recycled %zu frames (available now: %zu)", 
+                            tag, to_recycle, out_umem.free_frames.size());
+                    }
+                }
+                last_recycling_attempt = current_time;
+            }
         }
     }
 
@@ -352,20 +401,30 @@ void forward_step(const char* tag,
                     // Check if this EtherType is in our sample list
                     for (uint16_t target_et : sflow_config->ethertypes) {
                         if (et == target_et) {
-                            // Try to extract hardware timestamp for 1588 support
+                            // Extract timestamp based on configuration
                             uint64_t timestamp_ns = 0;
                             bool has_timestamp = false;
                             bool is_hw_timestamp = false;
                             
-                            // First try to get hardware timestamp from PTP hardware clock
-                            if (get_ptp_hw_timestamp(timestamp_ns)) {
-                                has_timestamp = true;
-                                is_hw_timestamp = true;
-                            } else if (extract_hw_timestamp(in_ep.fd, timestamp_ns)) {
-                                has_timestamp = true;
-                                is_hw_timestamp = true;
+                            if (sflow_config->use_hw_timestamp) {
+                                // Try hardware timestamp first if enabled
+                                if (get_ptp_hw_timestamp(timestamp_ns)) {
+                                    has_timestamp = true;
+                                    is_hw_timestamp = true;
+                                } else if (extract_hw_timestamp(in_ep.fd, timestamp_ns)) {
+                                    has_timestamp = true;
+                                    is_hw_timestamp = true;
+                                } else {
+                                    // Fallback to system time if hardware timestamp not available
+                                    struct timespec ts;
+                                    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+                                        timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+                                        has_timestamp = true;
+                                        is_hw_timestamp = false;
+                                    }
+                                }
                             } else {
-                                // Fallback to system time if hardware timestamp not available
+                                // Use system clock directly when hardware timestamp disabled
                                 struct timespec ts;
                                 if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
                                     timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
@@ -390,8 +449,17 @@ void forward_step(const char* tag,
     uint32_t tx_idx = 0;
     unsigned int tx_space = xsk_ring_prod__reserve(&out_ep.tx, rcvd, &tx_idx);
     unsigned int to_tx = std::min(rcvd, tx_space);
+    
+    // Debug: Show TX reservation results
+    if (debug_print) {
+        LOG(LogLevel::DEBUG, "[%s] TX: requested=%u, reserved=%u, to_tx=%u", tag, rcvd, tx_space, to_tx);
+    }
+    
     if (to_tx == 0) {
         // Release RX and recycle RX frames (no TX space)
+        if (debug_print) {
+            LOG(LogLevel::DEBUG, "[%s] TX: no space available, dropping packets", tag);
+        }
         xsk_ring_cons__release(&in_ep.rx, rcvd);
 
         uint32_t f_idx = 0;
@@ -406,10 +474,19 @@ void forward_step(const char* tag,
 
     // 4) Copy packets into output UMEM frames and fill TX descriptors
     unsigned int actually_tx = 0;
+    
+    if (debug_print) {
+        LOG(LogLevel::DEBUG, "[%s] TX: available frames before allocation: %zu", tag, out_umem.free_frames.size());
+    }
+    
     for (unsigned int i = 0; i < to_tx; ++i) {
         uint64_t out_addr = 0;
         if (!alloc_frame(out_umem, out_addr)) {
             // Out of output frames unexpectedly; stop here
+            if (debug_print) {
+                LOG(LogLevel::DEBUG, "[%s] TX: ran out of frames at packet %u/%u (available=%zu)", 
+                    tag, i, to_tx, out_umem.free_frames.size());
+            }
             break;
         }
 
@@ -422,14 +499,27 @@ void forward_step(const char* tag,
         struct xdp_desc* txd = xsk_ring_prod__tx_desc(&out_ep.tx, tx_idx + i);
         txd->addr = out_addr;
         txd->len  = len;
-
+        
+        // Track this frame for potential emergency recycling (igc workaround)
+        pending_tx_addrs.push_back(out_addr);
+        
         actually_tx++;
+    
+        if (debug_print) {
+            LOG(LogLevel::DEBUG, "[%s] TX: allocated frame %u, addr=0x%lx, len=%u", tag, i, out_addr, len);
+        }
     }
 
     // 5) Submit TX and kick
     if (actually_tx) {
         xsk_ring_prod__submit(&out_ep.tx, actually_tx);
         (void)sendto(out_ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0); // TX kick
+        
+        if (debug_print) {
+            LOG(LogLevel::DEBUG, "[%s] TX: submitted %u packets, kicked", tag, actually_tx);
+        }
+    } else if (debug_print) {
+        LOG(LogLevel::DEBUG, "[%s] TX: no packets to submit", tag);
     }
     
     // 5.5) Send S-Flow packets from processing queue if any are ready
@@ -569,6 +659,7 @@ static void print_usage(const char* prog) {
         << "  --sample.ethertypes L   Comma-separated EtherTypes to sample (e.g. 0x800,0x86DD)\n"
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
         << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
+        << "  --sample.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + length)\n"
@@ -665,6 +756,21 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
                 std::cerr << "Failed to parse destination MAC address\n";
                 return false;
             }
+        } else if (option == "--sample.hw_timestamp") {
+            std::string hw_ts_str = (eq_pos != std::string::npos) ? value : 
+                                   (i + 1 < argc ? argv[++i] : "");
+            if (hw_ts_str.empty()) {
+                std::cerr << "Missing value for --sample.hw_timestamp\n";
+                return false;
+            }
+            if (hw_ts_str == "true" || hw_ts_str == "1") {
+                cmd.sflow.use_hw_timestamp = true;
+            } else if (hw_ts_str == "false" || hw_ts_str == "0") {
+                cmd.sflow.use_hw_timestamp = false;
+            } else {
+                std::cerr << "Invalid hw_timestamp value: " << hw_ts_str << " (use true/false)\n";
+                return false;
+            }
         } else if (option == "--log-level") {
             std::string level_str = (eq_pos != std::string::npos) ? value : 
                                    (i + 1 < argc ? argv[++i] : "");
@@ -742,9 +848,9 @@ int main(int argc, char** argv) {
     base_cfg.libbpf_flags = 0;
 
     // Parameters
-    const uint32_t FRAME_COUNT = 8192; // tune as needed
-    const uint32_t FRAME_SIZE  = 2048; // must hold your MTU (1500 -> OK)
-    const uint32_t HEADROOM    = 0;
+    const uint32_t FRAME_COUNT = 4096; // tune as needed (reduced because frames are bigger)
+    const uint32_t FRAME_SIZE  = 4096; // I226 requires better alignment - power of 2
+    const uint32_t HEADROOM    = 256;  // I226 needs more headroom for metadata
     const uint32_t TX_RESERVE  = 1024; // reserve frames per UMEM for TX freelist
 
     // Verbose per-packet prints toggle
@@ -767,15 +873,33 @@ int main(int argc, char** argv) {
     XskEndpoint epA {}; // devA
     XskEndpoint epB {}; // devB
 
+    // Check for I226 test mode (force copy-mode-only)
+    bool force_copy_mode = (getenv("I226_COPY_MODE") != nullptr);
+    
     bool A_zerocopy=false, A_skb=false;
-    if (create_xsk_with_fallback(devA, epA, umemA, base_cfg, A_zerocopy, A_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
+    if (force_copy_mode) {
+        LOG(LogLevel::INFO, "I226_COPY_MODE enabled - using copy-mode-only binding for %s", devA);
+        if (create_xsk_copy_mode_only(devA, epA, umemA, base_cfg, /*queue_id=*/0)) {
+            xsk_umem__delete(umemB.umem); free(umemB.buffer);
+            xsk_umem__delete(umemA.umem); free(umemA.buffer);
+            return 1;
+        }
+    } else if (create_xsk_with_fallback(devA, epA, umemA, base_cfg, A_zerocopy, A_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
         xsk_umem__delete(umemB.umem); free(umemB.buffer);
         xsk_umem__delete(umemA.umem); free(umemA.buffer);
         return 1;
     }
 
     bool B_zerocopy=false, B_skb=false;
-    if (create_xsk_with_fallback(devB, epB, umemB, base_cfg, B_zerocopy, B_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
+    if (force_copy_mode) {
+        LOG(LogLevel::INFO, "I226_COPY_MODE enabled - using copy-mode-only binding for %s", devB);
+        if (create_xsk_copy_mode_only(devB, epB, umemB, base_cfg, /*queue_id=*/0)) {
+            xsk_socket__delete(epA.xsk);
+            xsk_umem__delete(umemB.umem); free(umemB.buffer);
+            xsk_umem__delete(umemA.umem); free(umemA.buffer);
+            return 1;
+        }
+    } else if (create_xsk_with_fallback(devB, epB, umemB, base_cfg, B_zerocopy, B_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
         xsk_socket__delete(epA.xsk);
         xsk_umem__delete(umemB.umem); free(umemB.buffer);
         xsk_umem__delete(umemA.umem); free(umemA.buffer);
@@ -810,6 +934,7 @@ int main(int argc, char** argv) {
         LOG(LogLevel::INFO, "S-Flow sampling enabled for A→B traffic:");
         LOG(LogLevel::INFO, "  - Sampling rate: 1 in %u packets", cmd.sflow.sampling_rate);
         LOG(LogLevel::INFO, "  - Skip VLAN tags: %s", cmd.sflow.skip_vlan ? "true" : "false");
+        LOG(LogLevel::INFO, "  - Hardware timestamp: %s", cmd.sflow.use_hw_timestamp ? "true" : "false");
         LOG(LogLevel::INFO, "  - Destination MAC: %02X:%02X:%02X:%02X:%02X:%02X", 
             cmd.sflow.dest_mac[0], cmd.sflow.dest_mac[1], cmd.sflow.dest_mac[2],
             cmd.sflow.dest_mac[3], cmd.sflow.dest_mac[4], cmd.sflow.dest_mac[5]);

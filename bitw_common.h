@@ -120,6 +120,7 @@ struct SFlowConfig {
     std::vector<uint16_t> ethertypes;
     bool skip_vlan = true;       // true = skip VLAN tags to find EtherType
     uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Magic destination MAC
+    bool use_hw_timestamp = false; // false = use system clock, true = try hardware timestamp
     
     bool is_enabled() const { return sampling_rate > 0 && !ethertypes.empty(); }
 };
@@ -189,6 +190,12 @@ int create_xsk_socket(const char* ifname,
                       UmemArea& ua,
                       struct xsk_socket_config& cfg,
                       uint32_t queue_id = 0);
+
+int create_xsk_copy_mode_only(const char* ifname,
+                              XskEndpoint& ep,
+                              UmemArea& ua,
+                              const struct xsk_socket_config& base_cfg,
+                              uint32_t queue_id = 0);
 
 int create_xsk_with_fallback(const char* ifname,
                              XskEndpoint& ep,
