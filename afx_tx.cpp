@@ -314,29 +314,51 @@ void create_test_packet(TestPacket& pkt, const uint8_t src_mac[6], const uint8_t
 
 void process_tx_completions(UmemArea& ua, bool verbose = false) {
     static uint64_t last_emergency_recycle = 0;
+    static uint64_t total_completions_ever = 0;
     
     uint32_t idx;
     unsigned int total_completed = 0;
+    
+    // DEBUG: Check completion ring state
+    uint32_t comp_producer = *ua.comp.producer;
+    uint32_t comp_consumer = *ua.comp.consumer;
+    uint32_t comp_available = comp_producer - comp_consumer;
+    
+    if (verbose) {
+        std::cout << "[DEBUG] Completion ring: producer=" << comp_producer 
+                  << " consumer=" << comp_consumer << " available=" << comp_available << std::endl;
+    }
     
     // Try multiple times to get completions (I226 workaround)
     for (int attempt = 0; attempt < 3; ++attempt) {
         unsigned int completed = xsk_ring_cons__peek(&ua.comp, 64, &idx);
         if (completed) {
+            if (verbose) {
+                std::cout << "[DEBUG] Got " << completed << " TX completions on attempt " << (attempt+1) << std::endl;
+            }
             for (unsigned int i = 0; i < completed; ++i) {
                 uint64_t addr = *xsk_ring_cons__comp_addr(&ua.comp, idx + i);
+                if (verbose) {
+                    std::cout << "[DEBUG] Completing TX frame addr=0x" << std::hex << addr << std::dec << std::endl;
+                }
                 free_frame(ua, addr);
             }
             xsk_ring_cons__release(&ua.comp, completed);
             total_completed += completed;
+            total_completions_ever += completed;
         }
         
         if (completed == 0 && attempt < 2) {
+            if (verbose) {
+                std::cout << "[DEBUG] No completions on attempt " << (attempt+1) << ", retrying..." << std::endl;
+            }
             usleep(100); // FIXED: Match bitw_sflow delay (was 50)
         }
     }
     
-    if (verbose && total_completed > 0) {
-        std::cout << "TX completions: " << total_completed << " frames recycled\n";
+    if (verbose) {
+        std::cout << "[DEBUG] TX completions this cycle: " << total_completed 
+                  << " (total ever: " << total_completions_ever << ")" << std::endl;
     }
     
     // I226 emergency recycling if frames seem stuck
@@ -345,6 +367,11 @@ void process_tx_completions(UmemArea& ua, bool verbose = false) {
         
     if (ua.free_frames.size() < 100 && total_completed == 0 &&  // FIXED: Match bitw_sflow threshold (was 50)
         (now - last_emergency_recycle) > 100) { // Every 100ms
+        
+        if (verbose) {
+            std::cout << "[DEBUG] EMERGENCY: Low free frames (" << ua.free_frames.size() 
+                      << ") and no completions detected!" << std::endl;
+        }
         
         // Emergency recycle some frames (I226 workaround for stuck completions)
         size_t emergency_recycle = std::min(ua.frame_count / 10, (uint32_t)50);
@@ -424,9 +451,24 @@ void transmit_packets(const char* /* ifname */, XskEndpoint& ep, UmemArea& ua,
         auto since_last_tx = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tx).count();
         
         if (since_last_tx >= interval_ms) {
+            // DEBUG: Check TX ring state before sending
+            uint32_t tx_producer = *ep.tx.producer;
+            uint32_t tx_consumer = *ep.tx.consumer;  
+            uint32_t tx_available = ep.tx.size - (tx_producer - tx_consumer);
+            
+            if (verbose) {
+                std::cout << "[DEBUG] TX ring before send: producer=" << tx_producer 
+                          << " consumer=" << tx_consumer << " available=" << tx_available 
+                          << " free_frames=" << ua.free_frames.size() << std::endl;
+            }
+            
             // Try to send a packet using bitw_sflow-style batching
             uint32_t tx_idx;
-            if (xsk_ring_prod__reserve(&ep.tx, 1, &tx_idx) > 0) {
+            uint32_t reserved = xsk_ring_prod__reserve(&ep.tx, 1, &tx_idx);
+            if (reserved > 0) {
+                if (verbose) {
+                    std::cout << "[DEBUG] Reserved TX slot: idx=" << tx_idx << " reserved=" << reserved << std::endl;
+                }
                 
                 uint64_t frame_addr;
                 if (alloc_frame(ua, frame_addr)) {
@@ -446,37 +488,69 @@ void transmit_packets(const char* /* ifname */, XskEndpoint& ep, UmemArea& ua,
                     // Track pending frame (like bitw_sflow)
                     pending_tx_addrs.push_back(frame_addr);
                     
+                    // DEBUG: Record pre-submit state
+                    uint32_t pre_submit_producer = *ep.tx.producer;
+                    
                     // Submit and kick (single call like bitw_sflow)
                     xsk_ring_prod__submit(&ep.tx, 1);
-                    (void)sendto(ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+                    
+                    // DEBUG: Record post-submit state
+                    uint32_t post_submit_producer = *ep.tx.producer;
+                    
+                    if (verbose) {
+                        std::cout << "[DEBUG] TX submit: producer " << pre_submit_producer 
+                                  << " -> " << post_submit_producer << std::endl;
+                    }
+                    
+                    // Critical sendto() syscall with detailed error checking
+                    ssize_t sendto_result = sendto(ep.fd, nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+                    int sendto_errno = errno;
+                    
+                    if (verbose) {
+                        std::cout << "[DEBUG] sendto() result=" << sendto_result;
+                        if (sendto_result < 0) {
+                            std::cout << " errno=" << sendto_errno << " (" << strerror(sendto_errno) << ")";
+                        }
+                        std::cout << std::endl;
+                    }
                     
                     sequence++;
                     total_sent++;
                     last_tx = now;
                     
                     if (verbose) {
-                        std::cout << "Sent packet #" << sequence-1 << " (frame addr=0x" 
+                        std::cout << "[DEBUG] Packet #" << sequence-1 << " submitted: frame=0x" 
                                  << std::hex << frame_addr << std::dec 
-                                 << ", free frames: " << ua.free_frames.size() << ")\n";
+                                 << " addr=0x" << std::hex << (frame_addr + ua.frame_headroom) << std::dec
+                                 << " len=" << sizeof(pkt) << " free_frames=" << ua.free_frames.size() << std::endl;
                     }
                 } else {
                     total_failed++;
                     if (verbose) {
-                        std::cout << "No free frames available for packet #" << sequence << "\n";
+                        std::cout << "[DEBUG] FAIL: No free frames for packet #" << sequence 
+                                  << " (free_frames=" << ua.free_frames.size() << ")" << std::endl;
                     }
                 }
             } else {
                 total_failed++;
                 if (verbose) {
-                    std::cout << "No TX ring space for packet #" << sequence << "\n";
+                    std::cout << "[DEBUG] FAIL: No TX ring space for packet #" << sequence 
+                              << " (reserved=" << reserved << " available=" << tx_available << ")" << std::endl;
                 }
             }
         }
         
-        // Print periodic stats
+        // Print periodic stats with ring state
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_stats).count() >= 5) {
-            std::cout << "Stats: sent=" << total_sent << " failed=" << total_failed 
-                     << " free_frames=" << ua.free_frames.size() << " pending_tx=" << pending_tx_addrs.size() << "\n";
+            uint32_t tx_prod = *ep.tx.producer;
+            uint32_t tx_cons = *ep.tx.consumer;
+            uint32_t comp_prod = *ua.comp.producer;
+            uint32_t comp_cons = *ua.comp.consumer;
+            
+            std::cout << "[STATS] sent=" << total_sent << " failed=" << total_failed 
+                     << " free_frames=" << ua.free_frames.size() << " pending_tx=" << pending_tx_addrs.size()
+                     << " tx_ring=" << tx_prod << "/" << tx_cons 
+                     << " comp_ring=" << comp_prod << "/" << comp_cons << std::endl;
             last_stats = now;
         }
         
