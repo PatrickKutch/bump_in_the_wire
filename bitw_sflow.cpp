@@ -276,8 +276,8 @@ void forward_step(const char* tag,
 {
     static constexpr uint32_t BATCH = 64;
     
-    // Static variable for IGC driver workaround - track pending TX frames
-    static std::vector<uint64_t> pending_tx_addrs;
+    // Thread-local variable for IGC driver workaround - track pending TX frames per thread
+    thread_local static std::vector<uint64_t> pending_tx_addrs;
 
     // 1) Reap TX completions on output UMEM (recycle TX frames) - try multiple times for igc
     int completion_attempts = 0;
@@ -313,7 +313,7 @@ void forward_step(const char* tag,
         
         // IGC driver SKB mode workaround: manual frame recycling
         // If we have very few frames left and no completions, assume they're stuck
-        static uint64_t last_recycling_attempt = 0;
+        thread_local static uint64_t last_recycling_attempt = 0;
         
         if (out_umem.free_frames.size() < 100 && total_completions == 0) {
             uint64_t current_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -342,7 +342,7 @@ void forward_step(const char* tag,
     unsigned int rcvd = xsk_ring_cons__peek(&in_ep.rx, BATCH, &rx_idx);
     
     // Debug: Show polling activity periodically
-    static uint64_t poll_count = 0;
+    thread_local static uint64_t poll_count = 0;
     poll_count++;
     if (poll_count % 10000 == 0) { // Every ~10K polls instead of 1M
         LOG(LogLevel::DEBUG, "[%s] Polling heartbeat... (poll #%lu, rcvd=%u)", tag, poll_count, rcvd);

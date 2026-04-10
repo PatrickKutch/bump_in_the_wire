@@ -248,9 +248,9 @@ void filter_step(const char* tag,
                  bool use_hw_timestamp = false)
 {
     static constexpr uint32_t BATCH = 64;
-    static uint32_t total_packets = 0;
-    static uint32_t watermarked_packets = 0;
-    static uint32_t dropped_packets = 0;
+    thread_local static uint32_t total_packets = 0;
+    thread_local static uint32_t watermarked_packets = 0;
+    thread_local static uint32_t dropped_packets = 0;
 
     // 1) Reap TX completions on output UMEM (recycle TX frames)
     {
