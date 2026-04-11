@@ -452,6 +452,7 @@ struct FilterCmd {
     bool use_hw_timestamp = false; // false = use system clock, true = try hardware timestamp
     LogLevel log_level = LogLevel::WARN;  // Default to WARN
     bool verbose = false;                 // Default to not verbose
+    bool i226_mode = false;               // I226-optimized AF_XDP settings
 };
 
 static void print_usage(const char* prog) {
@@ -467,6 +468,8 @@ static void print_usage(const char* prog) {
         << "                            Only packets with this magic MAC will be checked for watermarks\n"
         << "                            (default: 02:00:00:00:00:01)\n"
         << "  --watermark.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
+        << "\nHardware Compatibility:\n"
+        << "  --i226-mode             Use Intel I226-optimized AF_XDP settings\n"
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + action)\n"
@@ -564,6 +567,8 @@ static bool parse_args(int argc, char** argv, FilterCmd& cmd) {
             }
         } else if (option == "--verbose") {
             cmd.verbose = true;
+        } else if (option == "--i226-mode") {
+            cmd.i226_mode = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -638,15 +643,33 @@ int main(int argc, char** argv) {
     XskEndpoint epA {}; // devA
     XskEndpoint epB {}; // devB
 
+    // Check for I226 optimization mode (force copy-mode-only)
+    bool force_copy_mode = cmd.i226_mode;
+
     bool A_zerocopy=false, A_skb=false;
-    if (create_xsk_with_fallback(devA, epA, umemA, base_cfg, A_zerocopy, A_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
+    if (force_copy_mode) {
+        LOG(LogLevel::INFO, "I226 mode enabled - using copy-mode-only binding for %s", devA);
+        if (create_xsk_copy_mode_only(devA, epA, umemA, base_cfg, /*queue_id=*/0)) {
+            xsk_umem__delete(umemB.umem); free(umemB.buffer);
+            xsk_umem__delete(umemA.umem); free(umemA.buffer);
+            return 1;
+        }
+    } else if (create_xsk_with_fallback(devA, epA, umemA, base_cfg, A_zerocopy, A_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
         xsk_umem__delete(umemB.umem); free(umemB.buffer);
         xsk_umem__delete(umemA.umem); free(umemA.buffer);
         return 1;
     }
 
     bool B_zerocopy=false, B_skb=false;
-    if (create_xsk_with_fallback(devB, epB, umemB, base_cfg, B_zerocopy, B_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
+    if (force_copy_mode) {
+        LOG(LogLevel::INFO, "I226 mode enabled - using copy-mode-only binding for %s", devB);
+        if (create_xsk_copy_mode_only(devB, epB, umemB, base_cfg, /*queue_id=*/0)) {
+            xsk_socket__delete(epA.xsk);
+            xsk_umem__delete(umemB.umem); free(umemB.buffer);
+            xsk_umem__delete(umemA.umem); free(umemA.buffer);
+            return 1;
+        }
+    } else if (create_xsk_with_fallback(devB, epB, umemB, base_cfg, B_zerocopy, B_skb, /*queue_id=*/0, /*allow_skb_fallback=*/true)) {
         xsk_socket__delete(epA.xsk);
         xsk_umem__delete(umemB.umem); free(umemB.buffer);
         xsk_umem__delete(umemA.umem); free(umemA.buffer);

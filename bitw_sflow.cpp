@@ -646,6 +646,7 @@ struct Cmd {
     SFlowConfig sflow;
     LogLevel log_level = LogLevel::WARN;  // Default to WARN
     bool verbose = false;                 // Default to not verbose
+    bool i226_mode = false;               // I226-optimized AF_XDP settings
 };
 
 static void print_usage(const char* prog) {
@@ -660,6 +661,8 @@ static void print_usage(const char* prog) {
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
         << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
         << "  --sample.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
+        << "\nHardware Compatibility:\n"
+        << "  --i226-mode             Use Intel I226-optimized AF_XDP settings\n"
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + length)\n"
@@ -792,6 +795,8 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
             }
         } else if (option == "--verbose") {
             cmd.verbose = true;
+        } else if (option == "--i226-mode") {
+            cmd.i226_mode = true;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -873,12 +878,12 @@ int main(int argc, char** argv) {
     XskEndpoint epA {}; // devA
     XskEndpoint epB {}; // devB
 
-    // Check for I226 test mode (force copy-mode-only)
-    bool force_copy_mode = (getenv("I226_COPY_MODE") != nullptr);
+    // Check for I226 optimization mode (force copy-mode-only)
+    bool force_copy_mode = cmd.i226_mode;
     
     bool A_zerocopy=false, A_skb=false;
     if (force_copy_mode) {
-        LOG(LogLevel::INFO, "I226_COPY_MODE enabled - using copy-mode-only binding for %s", devA);
+        LOG(LogLevel::INFO, "I226 mode enabled - using copy-mode-only binding for %s", devA);
         if (create_xsk_copy_mode_only(devA, epA, umemA, base_cfg, /*queue_id=*/0)) {
             xsk_umem__delete(umemB.umem); free(umemB.buffer);
             xsk_umem__delete(umemA.umem); free(umemA.buffer);
@@ -892,7 +897,7 @@ int main(int argc, char** argv) {
 
     bool B_zerocopy=false, B_skb=false;
     if (force_copy_mode) {
-        LOG(LogLevel::INFO, "I226_COPY_MODE enabled - using copy-mode-only binding for %s", devB);
+        LOG(LogLevel::INFO, "I226 mode enabled - using copy-mode-only binding for %s", devB);
         if (create_xsk_copy_mode_only(devB, epB, umemB, base_cfg, /*queue_id=*/0)) {
             xsk_socket__delete(epA.xsk);
             xsk_umem__delete(umemB.umem); free(umemB.buffer);
