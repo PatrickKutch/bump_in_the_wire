@@ -6,6 +6,11 @@
 #include <chrono>
 #include <unistd.h>
 
+// Version and program information
+static const char* PROGRAM_VERSION = "v26.04.11";
+static const char* PROGRAM_NAME = "bitw_sflow";
+static const char* PROGRAM_AUTHOR = "Patrick Kutch";
+
 // -----------------------------------------------------------------------------
 // Thread-safe queue template
 // -----------------------------------------------------------------------------
@@ -649,6 +654,22 @@ struct Cmd {
     bool i226_mode = false;               // I226-optimized AF_XDP settings
 };
 
+static void print_brief_overview() {
+    std::cout << PROGRAM_NAME << " " << PROGRAM_VERSION << " - S-Flow Packet Forwarder with AF_XDP\n";
+    std::cout << "Author: " << PROGRAM_AUTHOR << "\n\n";
+    std::cout << "PURPOSE:\n";
+    std::cout << "  High-performance bidirectional packet forwarding between network interfaces\n";
+    std::cout << "  with optional S-Flow sampling and TCP watermarking capabilities.\n\n";
+    std::cout << "FEATURES:\n";
+    std::cout << "  • Zero-copy AF_XDP packet forwarding (A↔B bidirectional)\n";
+    std::cout << "  • S-Flow sampling with configurable rates and EtherTypes\n";
+    std::cout << "  • TCP watermarking (hash+timestamp injection)\n";
+    std::cout << "  • Hardware timestamp support (PTP-capable NICs)\n";
+    std::cout << "  • CPU pinning for performance optimization\n";
+    std::cout << "  • Intel I226 compatibility mode\n\n";
+    std::cout << "Use --help for detailed usage information.\n";
+}
+
 static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " <netdev_A> <netdev_B> [options]\n"
@@ -666,6 +687,9 @@ static void print_usage(const char* prog) {
         << "\nLogging:\n"
         << "  --log-level LEVEL       Set log level: DEBUG, INFO, WARN, ERROR (default: WARN)\n"
         << "  --verbose               Enable per-packet debug prints (EtherType + length)\n"
+        << "\nInformation:\n"
+        << "  --version               Show program version\n"
+        << "  --about                 Show program overview and features\n"
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
         << "  " << prog << " eth0 eth1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
@@ -797,6 +821,9 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
             cmd.verbose = true;
         } else if (option == "--i226-mode") {
             cmd.i226_mode = true;
+        } else if (option == "--about") {
+            print_brief_overview();
+            exit(0);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             return false;
@@ -817,6 +844,23 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
 // Main
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
+    // Handle special help arguments
+    if (argc == 2) {
+        std::string arg(argv[1]);
+        if (arg == "/?" || arg == "/help" || arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (arg == "/about" || arg == "--about") {
+            print_brief_overview();
+            return 0;
+        }
+        if (arg == "--version") {
+            std::cout << PROGRAM_NAME << " " << PROGRAM_VERSION << std::endl;
+            return 0;
+        }
+    }
+    
     Cmd cmd {};
     if (!parse_args(argc, argv, cmd)) {
         print_usage(argv[0]);
