@@ -23,6 +23,11 @@ private:
 public:
     void push(T item) {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Prevent unbounded growth - drop oldest items if queue gets too large
+        static constexpr size_t MAX_QUEUE_SIZE = 1000;
+        while (queue_.size() >= MAX_QUEUE_SIZE) {
+            queue_.pop(); // Remove oldest item
+        }
         queue_.push(std::move(item));
         condition_.notify_one();
     }
@@ -231,10 +236,18 @@ void watermark_processing_worker(const char* tag,
         
         // Wait for watermarked packets to process (100ms timeout to check running flag)
         if (input_queue.wait_and_pop(watermarked_packet, 100)) {
+            size_t queue_remaining = input_queue.size();
             // Process the watermarked packet
             process_watermarked_packet(tag, watermarked_packet.layers, 
                                      watermarked_packet.length, 
                                      watermarked_packet.socket_fd, use_hw_timestamp);
+            
+            // Log processing stats periodically
+            thread_local static uint32_t processed_count = 0;
+            processed_count++;
+            if ((processed_count % 1000) == 0) {
+                LOG(LogLevel::INFO, "[%s WMARK-PROC] Processed %u watermarked packets, queue remaining: %zu", tag, processed_count, queue_remaining);
+            }
         }
     }
 
@@ -313,7 +326,12 @@ void filter_step(const char* tag,
                         // Queue watermarked packet for processing in separate thread
                         if (watermark_queue) {
                             WatermarkedPacket watermarked_pkt(frame, rx_lens[i], layers, in_ep.fd);
+                            size_t queue_size_before = watermark_queue->size();
                             watermark_queue->push(std::move(watermarked_pkt));
+                            // Log warning if queue is growing large (potential processing backlog)
+                            if (queue_size_before > 500) {
+                                LOG(LogLevel::WARN, "[%s] Watermark processing queue large: %zu packets (processing may be falling behind)", tag, queue_size_before);
+                            }
                         } else {
                             // Fallback to direct processing if no queue provided
                             process_watermarked_packet(tag, layers, rx_lens[i], in_ep.fd, use_hw_timestamp);

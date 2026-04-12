@@ -281,16 +281,18 @@ void forward_step(const char* tag,
 {
     static constexpr uint32_t BATCH = 64;
     
-    // Thread-local variable for IGC driver workaround - track pending TX frames per thread
+    // Thread-local variable for TX completion notification workaround (originally for IGC driver)
+    // Use bounded buffer to prevent memory leak after hours of operation
     thread_local static std::vector<uint64_t> pending_tx_addrs;
+    static constexpr size_t MAX_PENDING_TX_FRAMES = 10000; // Limit to prevent unbounded growth
 
-    // 1) Reap TX completions on output UMEM (recycle TX frames) - try multiple times for igc
+    // 1) Reap TX completions on output UMEM (recycle TX frames) - try multiple times for slow drivers
     int completion_attempts = 0;
     {
         uint32_t c_idx = 0;
         unsigned int total_completions = 0;
         
-        // Try up to 3 times to get completions (igc driver workaround)
+        // Try up to 3 times to get completions (workaround for drivers with delayed notifications)
         for (int attempt = 0; attempt < 3; attempt++) { 
             unsigned int ncomp = xsk_ring_cons__peek(&out_umem.comp, BATCH, &c_idx);
             if (ncomp) {
@@ -303,7 +305,7 @@ void forward_step(const char* tag,
             }
             completion_attempts++;
             if (ncomp == 0 && attempt < 2) {
-                // Force a small delay and try again (igc driver may be slow)
+                // Force a small delay and try again (some drivers may be slow with notifications)
                 usleep(100); // 100 microseconds
             }
         }
@@ -316,7 +318,7 @@ void forward_step(const char* tag,
                 tag, completion_attempts);
         }
         
-        // IGC driver SKB mode workaround: manual frame recycling
+        // Emergency frame recycling for drivers with stuck TX completions (originally for IGC)
         // If we have very few frames left and no completions, assume they're stuck
         thread_local static uint64_t last_recycling_attempt = 0;
         
@@ -333,8 +335,8 @@ void forward_step(const char* tag,
                 if (to_recycle > 0) {
                     pending_tx_addrs.erase(pending_tx_addrs.begin(), pending_tx_addrs.begin() + to_recycle);
                     if (debug_print) {
-                        LOG(LogLevel::WARN, "[%s] IGC workaround: emergency recycled %zu frames (available now: %zu)", 
-                            tag, to_recycle, out_umem.free_frames.size());
+                        LOG(LogLevel::WARN, "[%s] Emergency recycling: freed %zu stuck frames (available now: %zu, pending tracked: %zu)", 
+                            tag, to_recycle, out_umem.free_frames.size(), pending_tx_addrs.size());
                     }
                 }
                 last_recycling_attempt = current_time;
@@ -505,7 +507,13 @@ void forward_step(const char* tag,
         txd->addr = out_addr;
         txd->len  = len;
         
-        // Track this frame for potential emergency recycling (igc workaround)
+        // Track this frame for potential emergency recycling (originally for IGC driver issues)
+        // Bounded buffer prevents memory leak during long runs - works for any driver
+        if (pending_tx_addrs.size() >= MAX_PENDING_TX_FRAMES) {
+            // Remove oldest frames when at limit (circular buffer behavior)
+            pending_tx_addrs.erase(pending_tx_addrs.begin(), 
+                                  pending_tx_addrs.begin() + (MAX_PENDING_TX_FRAMES / 4));
+        }
         pending_tx_addrs.push_back(out_addr);
         
         actually_tx++;
@@ -547,6 +555,14 @@ void forward_step(const char* tag,
                     struct xdp_desc* sflow_txd = xsk_ring_prod__tx_desc(&out_ep.tx, sflow_tx_idx);
                     sflow_txd->addr = sflow_out_addr;
                     sflow_txd->len = sflow_pkt->length;
+                    
+                    // Track S-Flow frame for emergency recycling consistency
+                    if (pending_tx_addrs.size() >= MAX_PENDING_TX_FRAMES) {
+                        // Remove oldest frames when at limit (circular buffer behavior)
+                        pending_tx_addrs.erase(pending_tx_addrs.begin(), 
+                                              pending_tx_addrs.begin() + (MAX_PENDING_TX_FRAMES / 4));
+                    }
+                    pending_tx_addrs.push_back(sflow_out_addr);
                     
                     // Submit S-Flow packet
                     xsk_ring_prod__submit(&out_ep.tx, 1);
