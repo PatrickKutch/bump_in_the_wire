@@ -122,7 +122,12 @@ struct SFlowConfig {
     uint8_t dest_mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01}; // Magic destination MAC
     bool use_hw_timestamp = false; // false = use system clock, true = try hardware timestamp
     
+    // Jitter configuration for timestamp randomization
+    uint32_t jitter_min = 0;     // Minimum jitter value (nanoseconds)
+    uint32_t jitter_max = 0;     // Maximum jitter value (nanoseconds)
+    
     bool is_enabled() const { return sampling_rate > 0 && !ethertypes.empty(); }
+    bool has_jitter() const { return jitter_max > jitter_min && jitter_max > 0; }
 };
 
 // S-Flow sampling state (per direction)

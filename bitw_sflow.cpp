@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <unistd.h>
+#include <random>
 
 // Version and program information
 static const char* PROGRAM_VERSION = "v26.04.13";
@@ -142,7 +143,8 @@ static inline uint64_t calculate_packet_hash(const uint8_t* data, uint32_t len) 
 // Create a magic MAC watermark packet for S-Flow processing  
 static std::unique_ptr<SFlowPacket> create_watermark_packet(const uint8_t* frame, uint32_t len,
                                                           uint64_t timestamp_ns, bool has_timestamp,
-                                                          const uint8_t* magic_mac) {
+                                                          const uint8_t* magic_mac,
+                                                          const SFlowConfig& sflow_config) {
     // Skip PTP packets (EtherType 0x88f7) - never watermark them
     uint16_t ethertype = 0;
     if (parse_ethertype_vlan_aware(frame, len, ethertype) && ethertype == 0x88f7) {
@@ -159,13 +161,28 @@ static std::unique_ptr<SFlowPacket> create_watermark_packet(const uint8_t* frame
     // Calculate hash of original packet
     uint64_t packet_hash = calculate_packet_hash(frame, len);
     
+    // Apply jitter to timestamp if configured
+    uint64_t jittered_timestamp = timestamp_ns;
+    if (sflow_config.has_jitter()) {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        std::uniform_int_distribution<uint32_t> dist(sflow_config.jitter_min, sflow_config.jitter_max);
+        uint32_t jitter_value = dist(gen);
+        jittered_timestamp += jitter_value;
+        
+        if (g_verbose_mode) {
+            LOG(LogLevel::DEBUG, "Applied jitter: +%u ns (range: %u-%u ns)", 
+                jitter_value, sflow_config.jitter_min, sflow_config.jitter_max);
+        }
+    }
+    
     // Create watermark payload: [hash:8][timestamp:8] = 16 bytes
     const uint32_t watermark_payload_size = 16;
     std::vector<uint8_t> watermark_payload(watermark_payload_size);
     
-    // Pack hash and timestamp in network byte order
+    // Pack hash and jittered timestamp in network byte order
     uint64_t hash_be = htobe64(packet_hash);
-    uint64_t timestamp_be = htobe64(timestamp_ns);
+    uint64_t timestamp_be = htobe64(jittered_timestamp);
     std::memcpy(watermark_payload.data(), &hash_be, 8);
     std::memcpy(watermark_payload.data() + 8, &timestamp_be, 8);
     
@@ -197,10 +214,10 @@ static std::unique_ptr<SFlowPacket> create_watermark_packet(const uint8_t* frame
     }
     
     LOG(LogLevel::DEBUG, "Watermark packet: hash=0x%016lX timestamp=%lu payload_size=%u magic_mac=%02X:%02X:%02X:%02X:%02X:%02X IPv%u",
-        packet_hash, timestamp_ns, watermark_payload_size, 
+        packet_hash, jittered_timestamp, watermark_payload_size, 
         magic_mac[0], magic_mac[1], magic_mac[2], magic_mac[3], magic_mac[4], magic_mac[5], layers.ip_version);
     
-    return std::make_unique<SFlowPacket>(watermark_frame.data(), watermark_packet_size, timestamp_ns, has_timestamp);
+    return std::make_unique<SFlowPacket>(watermark_frame.data(), watermark_packet_size, jittered_timestamp, has_timestamp);
 }
 
 static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const uint8_t* frame, uint32_t len, 
@@ -220,7 +237,7 @@ static std::unique_ptr<SFlowPacket> process_sflow_sample(const char* tag, const 
     
     // Create watermark packet with magic MAC address (works for any protocol)
     LOG(LogLevel::INFO, "[%s SFLOW] Creating watermark packet with magic MAC", tag);
-    return create_watermark_packet(frame, len, timestamp_ns, has_timestamp, config.dest_mac);
+    return create_watermark_packet(frame, len, timestamp_ns, has_timestamp, config.dest_mac, config);
 }
 
 // -----------------------------------------------------------------------------
@@ -698,6 +715,7 @@ static void print_usage(const char* prog) {
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
         << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
         << "  --sample.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
+        << "  --jitter MIN,MAX        Add random jitter to watermark timestamps (nanoseconds, e.g. 1000,5000)\n"
         << "\nHardware Compatibility:\n"
         << "  --i226-mode             Use Intel I226-optimized AF_XDP settings\n"
         << "\nLogging:\n"
@@ -709,7 +727,8 @@ static void print_usage(const char* prog) {
         << "\nExamples:\n"
         << "  " << prog << " eth0 eth1 --cpu.forwarding 2 --cpu.return 3\n"
         << "  " << prog << " eth0 eth1 --sample.sampling 1000 --sample.ethertypes=0x800,0x86DD\n"
-        << "  " << prog << " eth0 eth1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01 --log-level INFO\n";
+        << "  " << prog << " eth0 eth1 --sample.sampling 500 --sample.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
+        << "  " << prog << " eth0 eth1 --sample.sampling 1000 --sample.ethertypes=0x800 --jitter 1000,5000\n";
 }
 
 static bool parse_args(int argc, char** argv, Cmd& cmd) {
@@ -814,6 +833,36 @@ static bool parse_args(int argc, char** argv, Cmd& cmd) {
                 std::cerr << "Invalid hw_timestamp value: " << hw_ts_str << " (use true/false)\n";
                 return false;
             }
+        } else if (option == "--jitter") {
+            std::string jitter_str = (eq_pos != std::string::npos) ? value : 
+                                    (i + 1 < argc ? argv[++i] : "");
+            if (jitter_str.empty()) {
+                std::cerr << "Missing value for --jitter\n";
+                return false;
+            }
+            // Parse comma-separated jitter bounds: --jitter min,max
+            size_t comma_pos = jitter_str.find(',');
+            if (comma_pos == std::string::npos) {
+                std::cerr << "Invalid jitter format: " << jitter_str << " (use --jitter min,max)\n";
+                return false;
+            }
+            std::string min_str = jitter_str.substr(0, comma_pos);
+            std::string max_str = jitter_str.substr(comma_pos + 1);
+            
+            int min_val = std::atoi(min_str.c_str());
+            int max_val = std::atoi(max_str.c_str());
+            
+            if (min_val < 0 || max_val < 0) {
+                std::cerr << "Jitter values must be positive integers\n";
+                return false;
+            }
+            if (min_val >= max_val) {
+                std::cerr << "Jitter minimum (" << min_val << ") must be less than maximum (" << max_val << ")\n";
+                return false;
+            }
+            
+            cmd.sflow.jitter_min = static_cast<uint32_t>(min_val);
+            cmd.sflow.jitter_max = static_cast<uint32_t>(max_val);
         } else if (option == "--log-level") {
             std::string level_str = (eq_pos != std::string::npos) ? value : 
                                    (i + 1 < argc ? argv[++i] : "");
