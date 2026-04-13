@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 // Version and program information
-static const char* PROGRAM_VERSION = "v26.04.11";
+static const char* PROGRAM_VERSION = "v26.04.13";
 static const char* PROGRAM_NAME = "bitw_sflow";
 static const char* PROGRAM_AUTHOR = "Patrick Kutch";
 

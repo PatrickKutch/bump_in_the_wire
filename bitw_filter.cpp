@@ -6,7 +6,7 @@
 #include <chrono>
 
 // Version and program information
-static const char* PROGRAM_VERSION = "v26.04.11";
+static const char* PROGRAM_VERSION = "v26.04.13";
 static const char* PROGRAM_NAME = "bitw_filter";
 static const char* PROGRAM_AUTHOR = "Patrick Kutch";
 
@@ -99,7 +99,7 @@ static bool is_watermarked_tcp_packet(const PacketLayers& layers) {
 }
 
 // Check if a UDP packet is watermarked (future implementation)
-static bool is_watermarked_udp_packet(const PacketLayers& layers) {
+static bool is_watermarked_udp_packet(const PacketLayers& /* layers */) {
     // TODO: Implement UDP watermark detection
     // UDP doesn't have Reserved bits like TCP, so we'd need a different approach
     // Possibilities:
@@ -112,7 +112,7 @@ static bool is_watermarked_udp_packet(const PacketLayers& layers) {
 
 // Main watermark detection dispatcher - calls appropriate protocol handler
 // Since we now filter by magic MAC address, we only need to check protocol-specific watermarks
-static bool is_watermarked_packet(const uint8_t* frame, uint32_t len, const PacketLayers& layers) {
+static bool is_watermarked_packet(const uint8_t* /* frame */, uint32_t /* len */, const PacketLayers& layers) {
     if (!layers.valid) {
         LOG(LogLevel::ERROR, "Invalid packet layers for watermark detection");
         return false;

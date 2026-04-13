@@ -254,16 +254,17 @@ void create_test_packet(TestPacket& pkt, const uint8_t src_mac[6], const uint8_t
     udp_sum += htons(IPPROTO_UDP);
     udp_sum += htons(udp_len);
     
-    // UDP header + data
-    uint16_t *udp_ptr = (uint16_t*)&pkt.udp;
-    for (size_t i = 0; i < (udp_len + 1) / 2; ++i) {
-        udp_sum += ntohs(udp_ptr[i]);
+    // UDP header + data - use memcpy to avoid unaligned access warnings
+    uint16_t udp_words[(sizeof(struct udphdr) + sizeof(pkt.payload) + 1) / 2];
+    memcpy(udp_words, &pkt.udp, udp_len);
+    for (size_t i = 0; i < (static_cast<size_t>(udp_len) + 1) / 2; ++i) {
+        udp_sum += ntohs(udp_words[i]);
     }
     
     // Handle odd byte if payload length is odd
     if (udp_len & 1) {
-        udp_sum -= ntohs(udp_ptr[(udp_len - 1) / 2]) & 0x00FF;
-        udp_sum += (ntohs(udp_ptr[(udp_len - 1) / 2]) & 0xFF00);
+        udp_sum -= ntohs(udp_words[(udp_len - 1) / 2]) & 0x00FF;
+        udp_sum += (ntohs(udp_words[(udp_len - 1) / 2]) & 0xFF00);
     }
     
     while (udp_sum >> 16) {
@@ -271,12 +272,13 @@ void create_test_packet(TestPacket& pkt, const uint8_t src_mac[6], const uint8_t
     }
     pkt.udp.check = htons(~udp_sum);
     
-    // Calculate IP checksum
+    // Calculate IP checksum - use safer array access to avoid alignment warnings
     pkt.ip.check = 0; // Must be 0 for checksum calculation
     uint32_t ip_sum = 0;
-    uint16_t *ip_header = (uint16_t*)&pkt.ip;
-    for (int i = 0; i < 10; ++i) { // 20 bytes / 2 = 10 words
-        ip_sum += ntohs(ip_header[i]);
+    uint16_t ip_words[10]; // 20 bytes / 2 = 10 words
+    memcpy(ip_words, &pkt.ip, sizeof(struct iphdr));
+    for (int i = 0; i < 10; ++i) {
+        ip_sum += ntohs(ip_words[i]);
     }
     while (ip_sum >> 16) {
         ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
