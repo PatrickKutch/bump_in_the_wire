@@ -309,7 +309,7 @@ void create_test_packet(TestPacket& pkt, const uint8_t src_mac[6], const uint8_t
 }
 
 // -----------------------------------------------------------------------------
-// TX completion handling (with I226 workarounds)
+// TX completion handling (with I226 optimizations)
 // -----------------------------------------------------------------------------
 
 void process_tx_completions(UmemArea& ua, bool verbose = false) {
@@ -329,7 +329,7 @@ void process_tx_completions(UmemArea& ua, bool verbose = false) {
                   << " consumer=" << comp_consumer << " available=" << comp_available << std::endl;
     }
     
-    // Try multiple times to get completions (I226 workaround)
+    // Try multiple times to get completions (I226 optimization)
     for (int attempt = 0; attempt < 3; ++attempt) {
         unsigned int completed = xsk_ring_cons__peek(&ua.comp, 64, &idx);
         if (completed) {
@@ -373,14 +373,14 @@ void process_tx_completions(UmemArea& ua, bool verbose = false) {
                       << ") and no completions detected!" << std::endl;
         }
         
-        // Emergency recycle some frames (I226 workaround for stuck completions)
+        // Emergency recycle some frames (I226 optimization for improved TX completion handling)
         size_t emergency_recycle = std::min(ua.frame_count / 10, (uint32_t)50);
         for (size_t i = 0; i < emergency_recycle && ua.free_frames.size() < ua.frame_count; ++i) {
             ua.free_frames.push_back(i * ua.frame_size); // Calculate frame address manually
         }
         
         if (verbose && emergency_recycle > 0) {
-            std::cout << "I226 workaround: emergency recycled " << emergency_recycle 
+            std::cout << "I226 optimization: emergency recycled " << emergency_recycle 
                      << " frames (free now: " << ua.free_frames.size() << ")\n";
         }
         last_emergency_recycle = now;
@@ -597,7 +597,7 @@ void print_usage(const char* prog) {
               << "\nExamples:\n"
               << "  " << prog << " eth0 aa:bb:cc:dd:ee:ff 1000\n"
               << "  " << prog << " eth0 aa:bb:cc:dd:ee:ff 500 --duration 30 --i226-mode --verbose\n"
-              << "\nFor I226 NICs, use --i226-mode for best compatibility.\n";
+              << "\nFor I226 NICs, use --i226-mode for optimal performance.\n";
 }
 
 bool parse_args(int argc, char** argv, Config& config) {

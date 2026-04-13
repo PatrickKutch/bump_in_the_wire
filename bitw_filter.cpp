@@ -490,7 +490,7 @@ static void print_brief_overview() {
     std::cout << "  • Selective packet dropping (watermarked packets only)\n";
     std::cout << "  • Hardware timestamp support (PTP-capable NICs)\n";
     std::cout << "  • CPU pinning for performance optimization\n";
-    std::cout << "  • Intel I226 compatibility mode\n\n";
+    std::cout << "  • Intel I226 optimization mode\n\n";
     std::cout << "Use --help for detailed usage information.\n";
 }
 

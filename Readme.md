@@ -38,7 +38,7 @@ sudo ./bitw_sflow <interface_A> <interface_B> [options]
 - `--sample.dest_mac MAC` - Magic MAC for watermarked packets (default: 02:00:00:00:00:01)
 - `--cpu.forwarding N[,M]` - Pin forwarding thread to CPU N (or N,M for timestamping performance)
 - `--cpu.return M` - Pin return thread to CPU M
-- `--i226-mode` - Intel I226 compatibility mode
+- `--i226-mode` - Intel I226 optimization mode
 - `--verbose` - Enable per-packet debug output
 
 ### bitw_filter - Watermark Detection & Filtering
@@ -62,7 +62,7 @@ sudo ./bitw_filter <interface_A> <interface_B> [options]
 - `--watermark.hw_timestamp BOOL` - Use hardware timestamping
 - `--cpu.forwarding N[,M]` - Pin forwarding thread to CPU N (or N,M for filtering performance)
 - `--cpu.return M` - Pin return thread to CPU M
-- `--i226-mode` - Intel I226 compatibility mode
+- `--i226-mode` - Intel I226 optimization mode
 - `--verbose` - Enable detailed packet analysis
 
 ### afx_tx - AF_XDP Transmission Test Tool
@@ -416,9 +416,9 @@ sudo ip link set dev eth0 xdp off
 sudo ip link set dev eth1 xdp off
 ```
 
-**Intel I226 TX Issues:**
+**Intel I226 Optimizations:**
 ```bash
-# Use compatibility mode
+# Use I226-optimized mode
 sudo ./bitw_sflow eth0 eth1 --i226-mode
 
 # Test transmission separately

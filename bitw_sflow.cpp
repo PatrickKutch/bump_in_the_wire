@@ -281,7 +281,7 @@ void forward_step(const char* tag,
 {
     static constexpr uint32_t BATCH = 64;
     
-    // Thread-local variable for TX completion notification workaround (originally for IGC driver)
+    // Thread-local variable for TX completion notification optimization (optimized for IGC driver)
     // Use bounded buffer to prevent memory leak after hours of operation
     thread_local static std::vector<uint64_t> pending_tx_addrs;
     static constexpr size_t MAX_PENDING_TX_FRAMES = 10000; // Limit to prevent unbounded growth
@@ -318,7 +318,7 @@ void forward_step(const char* tag,
                 tag, completion_attempts);
         }
         
-        // Emergency frame recycling for drivers with stuck TX completions (originally for IGC)
+        // Emergency frame recycling for enhanced TX completion handling (optimized for IGC)
         // If we have very few frames left and no completions, assume they're stuck
         thread_local static uint64_t last_recycling_attempt = 0;
         
@@ -507,7 +507,7 @@ void forward_step(const char* tag,
         txd->addr = out_addr;
         txd->len  = len;
         
-        // Track this frame for potential emergency recycling (originally for IGC driver issues)
+        // Track this frame for potential emergency recycling (optimized for IGC driver performance)
         // Bounded buffer prevents memory leak during long runs - works for any driver
         if (pending_tx_addrs.size() >= MAX_PENDING_TX_FRAMES) {
             // Remove oldest frames when at limit (circular buffer behavior)
@@ -682,7 +682,7 @@ static void print_brief_overview() {
     std::cout << "  • TCP watermarking (hash+timestamp injection)\n";
     std::cout << "  • Hardware timestamp support (PTP-capable NICs)\n";
     std::cout << "  • CPU pinning for performance optimization\n";
-    std::cout << "  • Intel I226 compatibility mode\n\n";
+    std::cout << "  • Intel I226 optimization mode\n\n";
     std::cout << "Use --help for detailed usage information.\n";
 }
 

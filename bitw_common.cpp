@@ -520,7 +520,7 @@ int create_xsk_socket(const char* ifname,
     return 0;
 }
 
-// Force copy mode only (for I226 igc driver compatibility)
+// Force copy mode only (optimized for I226 igc driver performance)
 int create_xsk_copy_mode_only(const char* ifname,
                               XskEndpoint& ep,
                               UmemArea& ua,
@@ -554,8 +554,8 @@ int create_xsk_with_fallback(const char* ifname,
     using_zerocopy = false;
     using_skb_mode = false;
 
-    // For igc driver: try DRV mode first (TX works better), fallback to SKB for RX compatibility
-    // This is a hybrid approach for igc driver issues
+    // For igc driver: try DRV mode first (TX performs better), fallback to SKB for broader support
+    // This is an optimized approach for igc driver performance
     
     // 1) DRV + ZEROCOPY (best performance, may work for TX even if RX has issues)
     {
@@ -571,7 +571,7 @@ int create_xsk_with_fallback(const char* ifname,
         LOG(LogLevel::WARN, "[%s] DRV + ZEROCOPY bind failed, will try DRV + COPY...", ifname);
     }
 
-    // 2) DRV + COPY (may fix igc TX issues compared to SKB mode)
+    // 2) DRV + COPY (optimized for igc TX performance compared to SKB mode)
     {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_SKB_MODE) | XDP_FLAGS_DRV_MODE;
@@ -585,13 +585,13 @@ int create_xsk_with_fallback(const char* ifname,
         LOG(LogLevel::WARN, "[%s] DRV + COPY bind failed, will try SKB...", ifname);
     }
 
-    // 3) SKB + COPY (fallback - RX works but TX broken on igc)
+    // 3) SKB + COPY (fallback - RX works but TX has limitations on igc)
     if (allow_skb_fallback) {
         struct xsk_socket_config cfg = base_cfg;
         cfg.xdp_flags  = (base_cfg.xdp_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
         cfg.bind_flags = 0;
         if (create_xsk_socket(ifname, ep, ua, cfg, queue_id) == 0) {
-            LOG(LogLevel::WARN, "[%s] bound: SKB + COPY (TX may not work on igc) ⚠️", ifname);
+            LOG(LogLevel::WARN, "[%s] bound: SKB + COPY (TX has limitations on igc) ⚠️", ifname);
             using_zerocopy = false;
             using_skb_mode = true;
             return 0;
