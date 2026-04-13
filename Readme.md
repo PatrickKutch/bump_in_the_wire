@@ -174,6 +174,59 @@ docker build -t bitw_xdp:docker-only .
 podman build -t bitw_xdp:docker-only .
 ```
 
+### Container Packaging and Transfer
+
+Once you've built the container, you can package it for transfer to target systems:
+
+**Export Container Image:**
+```bash
+# Using Docker
+docker save bitw_xdp:docker-only -o bitw_xdp-container.tar
+
+# Using Podman  
+podman save bitw_xdp:docker-only -o bitw_xdp-container.tar
+
+# Optional: Compress for faster transfer
+gzip bitw_xdp-container.tar
+```
+
+**Transfer to Target System:**
+```bash
+# Transfer compressed container
+scp bitw_xdp-container.tar.gz user@target-system:/tmp/
+
+# Or transfer uncompressed
+scp bitw_xdp-container.tar user@target-system:/tmp/
+```
+
+**Load Container on Target System:**
+```bash
+# On the target system - decompress if needed
+gunzip /tmp/bitw_xdp-container.tar.gz
+
+# Load container image
+docker load -i /tmp/bitw_xdp-container.tar
+# Or for Podman:
+podman load -i /tmp/bitw_xdp-container.tar
+
+# Verify container is loaded
+docker images | grep bitw_xdp
+# Or for Podman:
+podman images | grep bitw_xdp
+
+# Clean up transfer file
+rm /tmp/bitw_xdp-container.tar
+```
+
+**Alternative: Direct Transfer with Compression:**
+```bash
+# One-liner: build, save, compress, and transfer
+docker save bitw_xdp:docker-only | gzip | ssh user@target-system 'gunzip | docker load'
+
+# Or for Podman
+podman save bitw_xdp:docker-only | gzip | ssh user@target-system 'gunzip | podman load'
+```
+
 ## 🚀 Running the Programs
 
 ### Prerequisites Setup
