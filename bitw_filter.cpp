@@ -86,6 +86,7 @@ struct WatermarkedPacket {
 // -----------------------------------------------------------------------------
 
 // Check if a TCP packet is watermarked by examining Reserved bits
+// currently unused - was used in early testing but now we rely on magic MAC address filtering instead
 static bool is_watermarked_tcp_packet(const PacketLayers& layers) {
     // Check TCP Reserved bits (upper 4 bits of byte 12 in TCP header)
     uint32_t reserved_byte_offset = 12; // Relative to TCP header start
@@ -152,9 +153,9 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
     // LOG(LogLevel::DEBUG, "Extracted BE values: hash_be=0x%016lX timestamp_be=0x%016lX", hash_be, timestamp_be);
     // LOG(LogLevel::DEBUG, "Converted LE values: hash=0x%016lX timestamp=%lu", extracted_hash, extracted_timestamp);
     
-    // Extract Reserved bits value
-    uint8_t tcp_flags_byte = layers.l4_header[12];
-    uint8_t reserved_bits = (tcp_flags_byte >> 4) & 0x0F;
+    // Extract Reserved bits value (not used in current watermarking approach, but can be useful for debugging)
+    //uint8_t tcp_flags_byte = layers.l4_header[12];
+    //uint8_t reserved_bits = (tcp_flags_byte >> 4) & 0x0F;
     
     // Get current timestamp for latency measurement based on configuration
     uint64_t rx_timestamp_ns = 0;
@@ -209,10 +210,16 @@ static void process_watermarked_packet(const char* tag, const PacketLayers& laye
     const char* ts_type = is_hw_timestamp ? "HW" : "SW";
     const char* latency_sign = negative_latency ? "-" : "";
     
-    LOG(LogLevel::INFO, "[%s WATERMARK] Detected packet: hash=0x%016lX timestamp=%lu ns "
-                        "reserved_bits=0x%02X latency=%s%.3f ms (%s) IPv%u len=%u",
-        tag, extracted_hash, extracted_timestamp, reserved_bits, latency_sign, latency_ms, ts_type,
-        layers.ip_version, len);
+    // If current log level is WARN or ERROR (INFO messages won't be shown), 
+    // just print latency value for basic monitoring
+    if (g_log_level >= LogLevel::WARN) {
+        std::fprintf(stderr, "%.3f\n", latency_ms);  // Just print latency in ms, ignore sign
+    } else {
+        LOG(LogLevel::INFO, "[%s WATERMARK] Detected packet: hash=0x%016lX timestamp=%lu ns "
+                            "latency=%s%.3f ms (%s) IPv%u len=%u",
+            tag, extracted_hash, extracted_timestamp, latency_sign, latency_ms, ts_type,
+            layers.ip_version, len);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -243,11 +250,11 @@ void watermark_processing_worker(const char* tag,
                                      watermarked_packet.socket_fd, use_hw_timestamp);
             
             // Log processing stats periodically
-            thread_local static uint32_t processed_count = 0;
-            processed_count++;
-            if ((processed_count % 1000) == 0) {
-                LOG(LogLevel::INFO, "[%s WMARK-PROC] Processed %u watermarked packets, queue remaining: %zu", tag, processed_count, queue_remaining);
-            }
+            // thread_local static uint32_t processed_count = 0;
+            // processed_count++;
+            // if ((processed_count % 1000) == 0) {
+            //     LOG(LogLevel::INFO, "[%s WMARK-PROC] Processed %u watermarked packets, queue remaining: %zu", tag, processed_count, queue_remaining);
+            // }
         }
     }
 
@@ -357,11 +364,11 @@ void filter_step(const char* tag,
         }
         
         // Periodic stats logging
-        if ((total_packets % 10000) == 0 && total_packets > 0) {
-            double drop_rate = (static_cast<double>(dropped_packets) / total_packets) * 100.0;
-            LOG(LogLevel::INFO, "[%s STATS] Total: %u, Watermarked: %u, Dropped: %u (%.2f%%)",
-                tag, total_packets, watermarked_packets, dropped_packets, drop_rate);
-        }
+        // if ((total_packets % 10000) == 0 && total_packets > 0) {
+        //     double drop_rate = (static_cast<double>(dropped_packets) / total_packets) * 100.0;
+        //     LOG(LogLevel::INFO, "[%s STATS] Total: %u, Watermarked: %u, Dropped: %u (%.2f%%)",
+        //         tag, total_packets, watermarked_packets, dropped_packets, drop_rate);
+        // }
     }
 
     // Count packets to forward
@@ -656,6 +663,7 @@ int main(int argc, char** argv) {
     // Apply log level and verbose settings
     set_log_level(cmd.log_level);
     set_verbose_mode(cmd.verbose);
+    suppress_libbpf_messages();
 
     std::cout << "Watermark Packet Filter with AF_XDP\n";
     std::cout << "Device A: " << devA << "\n";

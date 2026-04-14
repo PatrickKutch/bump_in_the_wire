@@ -12,11 +12,13 @@ RUN apt-get update && apt-get install -y \
     libxdp-dev \
     linux-headers-generic \
     linux-tools-generic \
+    clang \
     make \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY bitw_common.h bitw_common.cpp bitw_sflow.cpp bitw_filter.cpp afx_tx.cpp Makefile ./
+COPY bitw_sflow_xdp.bpf.c bitw_filter_xdp.bpf.c ./
 
 # Build all applications including standalone afx_tx
 RUN make clean && make && make afx_tx
@@ -40,6 +42,8 @@ WORKDIR /app
 COPY --from=builder /app/bitw_sflow .
 COPY --from=builder /app/bitw_filter .
 COPY --from=builder /app/afx_tx .
+COPY --from=builder /app/bitw_sflow_xdp.bpf.o .
+COPY --from=builder /app/bitw_filter_xdp.bpf.o .
 COPY Readme.md .
 
 RUN chmod +x bitw_sflow bitw_filter afx_tx

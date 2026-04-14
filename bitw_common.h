@@ -36,6 +36,7 @@
 #include <xdp/xsk.h>
 #include <linux/if_link.h> // XDP_FLAGS_*
 #include <linux/if_xdp.h>  // kernel UAPI
+#include <bpf/libbpf.h>    // for libbpf_set_print to suppress messages
 
 // -----------------------------------------------------------------------------
 // Compatibility shim for older headers (define zerocopy bind flag if missing)
@@ -57,6 +58,7 @@ const char* log_level_str(LogLevel level);
 std::string get_timestamp();
 void set_log_level(LogLevel level);
 void set_verbose_mode(bool verbose);
+void suppress_libbpf_messages();
 
 #define LOG(level, ...) do { \
     if (level >= g_log_level) { \

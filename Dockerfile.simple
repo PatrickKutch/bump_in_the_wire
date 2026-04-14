@@ -1,0 +1,52 @@
+# Faster Docker build - use existing compiled binaries
+FROM ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y \
+    libbpf1 \
+    libxdp1 \
+    iproute2 \
+    ethtool \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pre-built binaries (built on host)  
+COPY bitw_sflow bitw_filter afx_tx ./
+COPY Readme.md ./
+
+RUN chmod +x bitw_sflow bitw_filter afx_tx
+
+# Create entrypoint script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+# Default program is sflow\n\
+PROGRAM="${BITW_MODE:-sflow}"\n\
+\n\
+case "$PROGRAM" in\n\
+    sflow)\n\
+        BINARY="./bitw_sflow"\n\
+        DESCRIPTION="S-Flow Packet Forwarder with TCP Watermarking"\n\
+        ;;\n\
+    filter)\n\
+        BINARY="./bitw_filter"\n\
+        DESCRIPTION="Watermark Packet Filter"\n\
+        ;;\n\
+    afx_tx)\n\
+        BINARY="./afx_tx"\n\
+        DESCRIPTION="AF_XDP Transmission Test Tool"\n\
+        ;;\n\
+    *)\n\
+        echo "Error: Unknown BITW_MODE=${PROGRAM}"\n\
+        echo "Valid modes: sflow, filter, afx_tx"\n\
+        exit 1\n\
+        ;;\n\
+esac\n\
+\n\
+echo "Running ${DESCRIPTION}..."\n\
+exec ${BINARY} "$@"\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]

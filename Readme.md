@@ -3,6 +3,17 @@
 
 **bitw_xdp** is a high-performance AF_XDP packet forwarding system designed for network latency measurement, flow analysis, and traffic monitoring. This project was developed as an exploration into AF_XDP programming techniques and hardware timestamping capabilities. The system consists of two main programs that work together to provide "bump-in-the-wire" packet processing with minimal impact on network flows.
 
+## ⚠️ PTP Compatibility Notice
+
+**Important:** The current implementation does not support PTP (Precision Time Protocol) traffic coexistence. When these programs are active on an interface, PTP packets (EtherType 0x88f7) will be intercepted by AF_XDP and will not reach the kernel's PTP subsystem, potentially disrupting time synchronization.
+
+**Possible workarounds (currently out of scope):**
+- Create custom XDP filters to redirect PTP traffic to the kernel
+- Use `ethtool` or `ip link` commands to route PTP traffic to dedicated RX queues not used by these programs
+- Run PTP services on separate network interfaces not used by bitw_xdp programs
+
+For deployments requiring PTP synchronization, consider using separate interfaces for data forwarding and time synchronization.
+
 ## 🏗️ System Overview
 
 The bitw_xdp system provides two main programs and a testing utility:

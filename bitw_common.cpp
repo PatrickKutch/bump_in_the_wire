@@ -1,4 +1,27 @@
 #include "bitw_common.h"
+#include <cstdarg>  // for va_list, vsnprintf, vfprintf
+
+// -----------------------------------------------------------------------------
+// libbpf message filtering
+// -----------------------------------------------------------------------------
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+{
+    // Suppress all libbpf INFO, WARN, and DEBUG messages to reduce noise
+    // Only let ERROR messages through as they indicate real problems
+    if (level == LIBBPF_WARN || level == LIBBPF_INFO || level == LIBBPF_DEBUG) {
+        return 0; // Skip all non-error messages
+    }
+    
+    // Let ERROR and any other level messages through 
+    if (format) {
+        return vfprintf(stderr, format, args);
+    }
+    return 0;
+}
+
+void suppress_libbpf_messages() {
+    libbpf_set_print(libbpf_print_fn);
+}
 
 // -----------------------------------------------------------------------------
 // Logging utilities implementation

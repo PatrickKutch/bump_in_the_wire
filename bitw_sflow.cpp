@@ -168,10 +168,10 @@ static std::unique_ptr<SFlowPacket> create_watermark_packet(const uint8_t* frame
         static std::mt19937 gen(rd());
         std::uniform_int_distribution<uint32_t> dist(sflow_config.jitter_min, sflow_config.jitter_max);
         uint32_t jitter_value = dist(gen);
-        jittered_timestamp += jitter_value;
+        jittered_timestamp -= jitter_value;
         
         if (g_verbose_mode) {
-            LOG(LogLevel::DEBUG, "Applied jitter: +%u ns (range: %u-%u ns)", 
+            LOG(LogLevel::DEBUG, "Applied jitter: -%u ns (range: %u-%u ns)", 
                 jitter_value, sflow_config.jitter_min, sflow_config.jitter_max);
         }
     }
@@ -715,7 +715,7 @@ static void print_usage(const char* prog) {
         << "  --sample.skip_vlan B    Skip VLAN tags to find EtherType (true/false, default: true)\n"
         << "  --sample.dest_mac MAC   Destination MAC for watermark packets (e.g. 02:00:00:00:00:01)\n"
         << "  --sample.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
-        << "  --jitter MIN,MAX        Add random jitter to watermark timestamps (nanoseconds, e.g. 1000,5000)\n"
+        << "  --jitter MIN,MAX        Subtract random jitter from watermark timestamps (nanoseconds, e.g. 1000,5000)\n"
         << "\nHardware Compatibility:\n"
         << "  --i226-mode             Use Intel I226-optimized AF_XDP settings\n"
         << "\nLogging:\n"
@@ -938,6 +938,7 @@ int main(int argc, char** argv) {
     // Apply log level and verbose settings
     set_log_level(cmd.log_level);
     set_verbose_mode(cmd.verbose);
+    suppress_libbpf_messages();
 
     std::cout << "S-Flow Packet Forwarder with AF_XDP\n";
     std::cout << "Device A: " << devA << "\n";

@@ -9,9 +9,17 @@ echo "✅ Only requires Docker on host"
 echo "✅ Uses Ubuntu 24.04 which has libxdp packages"
 echo ""
 
-# Build the container using only Docker
-echo "Building container with Docker-only approach..."
-docker build -t bitw_xdp:docker-only .
+# Build the container - try fast approach first
+if which make >/dev/null 2>&1 && which clang >/dev/null 2>&1; then
+    echo "🚀 Using fast build (local compilation + runtime container)..."
+    make clean && make -j4
+    echo "Building runtime container with pre-built binaries..."
+    docker build -f Dockerfile.simple -t bitw_xdp:docker-only .
+else
+    echo "⚙️  Using full build (compile inside container)..."
+    echo "This may take several minutes to install development packages..."
+    docker build -t bitw_xdp:docker-only .
+fi
 
 echo ""
 echo "🎉 Build Complete!"

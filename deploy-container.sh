@@ -1,16 +1,15 @@
 #!/bin/bash
 
-# Deploy bitw_xdp container to remote host
-# Usage: ./deploy-container.sh [remote_host] [remote_user]
+# Deploy bitw_xdp container to encoder and decoder hosts
+# Usage: ./deploy-to-ifed.sh [remote_user]
 
 set -e  # Exit on any error
 
 # Configuration
-REMOTE_HOST="${1:-npg-svr-33}"
-REMOTE_USER="${2:-root}"
+REMOTE_HOSTS=("encoder" "decoder")
+REMOTE_USER="${1:-root}"
 CONTAINER_IMAGE="bitw_xdp:docker-only"
 TEMP_FILE="bitw_xdp-docker-only.tar.gz"
-REMOTE_PATH="/tmp/${TEMP_FILE}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -51,16 +50,82 @@ cleanup_local() {
     fi
 }
 
-# Function to cleanup remote temp files
+# Function to cleanup remote temp files on all hosts
 cleanup_remote() {
-    log_info "Cleaning up remote temp file: ${REMOTE_PATH}"
-    ssh "${REMOTE_USER}@${REMOTE_HOST}" "rm -f '${REMOTE_PATH}'" 2>/dev/null || true
+    for REMOTE_HOST in "${REMOTE_HOSTS[@]}"; do
+        REMOTE_PATH="/tmp/${TEMP_FILE}"
+        log_info "Cleaning up remote temp file on ${REMOTE_HOST}: ${REMOTE_PATH}"
+        ssh "${REMOTE_USER}@${REMOTE_HOST}" "rm -f '${REMOTE_PATH}'" 2>/dev/null || true
+    done
+}
+
+# Function to deploy to a single host
+deploy_to_host() {
+    local REMOTE_HOST="$1"
+    local REMOTE_PATH="/tmp/${TEMP_FILE}"
+    
+    log_info "=== Deploying to ${REMOTE_HOST} ==="
+    
+    # Test SSH connectivity
+    log_info "Testing SSH connectivity to ${REMOTE_USER}@${REMOTE_HOST}..."
+    if ! ssh -o ConnectTimeout=10 "${REMOTE_USER}@${REMOTE_HOST}" "echo 'SSH connection successful'" 2>/dev/null; then
+        log_error "Failed to connect to ${REMOTE_USER}@${REMOTE_HOST}"
+        log_error "Please check:"
+        log_error "  - Host is reachable"
+        log_error "  - SSH keys are configured"
+        log_error "  - Username is correct"
+        return 1
+    fi
+    log_success "SSH connectivity confirmed for ${REMOTE_HOST}"
+
+    # Transfer container to remote host
+    log_info "Transferring container to ${REMOTE_HOST}..."
+    if scp "${TEMP_FILE}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"; then
+        log_success "Container transferred successfully to ${REMOTE_HOST}"
+    else
+        log_error "Failed to transfer container to ${REMOTE_HOST}"
+        return 1
+    fi
+
+    # Load container on remote host using podman
+    log_info "Loading container on ${REMOTE_HOST} using podman..."
+    ssh "${REMOTE_USER}@${REMOTE_HOST}" << EOF
+set -e
+
+echo "Loading container image with podman..."
+gunzip -c "${REMOTE_PATH}" | podman load
+
+echo "Verifying container was loaded..."
+echo "Checking for image: ${CONTAINER_IMAGE}"
+if podman images --format "{{.Repository}}:{{.Tag}}" | grep -q "bitw_xdp:docker-only"; then
+    echo "✅ Container loaded successfully on ${REMOTE_HOST}"
+    podman images | grep bitw_xdp
+else
+    echo "❌ Container failed to load on ${REMOTE_HOST}"
+    echo "Available images:"
+    podman images --format "{{.Repository}}:{{.Tag}}"
+    exit 1
+fi
+
+echo "Cleaning up remote temp file..."
+rm -f "${REMOTE_PATH}"
+EOF
+
+    if [[ $? -eq 0 ]]; then
+        log_success "Container deployment to ${REMOTE_HOST} completed successfully!"
+        return 0
+    else
+        log_error "Container deployment to ${REMOTE_HOST} failed"
+        return 1
+    fi
 }
 
 # Trap to ensure cleanup on exit
 trap 'cleanup_local; cleanup_remote' EXIT
 
-log_info "Starting container deployment to ${REMOTE_USER}@${REMOTE_HOST}"
+log_info "Starting container deployment to encoder and decoder systems"
+log_info "Remote user: ${REMOTE_USER}"
+log_info "Target hosts: ${REMOTE_HOSTS[*]}"
 
 # Check required commands
 check_command docker
@@ -87,59 +152,48 @@ docker save "${CONTAINER_IMAGE}" | gzip > "${TEMP_FILE}"
 ARCHIVE_SIZE=$(du -h "${TEMP_FILE}" | cut -f1)
 log_success "Container exported to ${TEMP_FILE} (${ARCHIVE_SIZE})"
 
-# Step 3: Test SSH connectivity
-log_info "Testing SSH connectivity to ${REMOTE_USER}@${REMOTE_HOST}..."
-if ! ssh -o ConnectTimeout=10 "${REMOTE_USER}@${REMOTE_HOST}" "echo 'SSH connection successful'" 2>/dev/null; then
-    log_error "Failed to connect to ${REMOTE_USER}@${REMOTE_HOST}"
-    log_error "Please check:"
-    log_error "  - Host is reachable"
-    log_error "  - SSH keys are configured"
-    log_error "  - Username is correct"
-    exit 1
-fi
-log_success "SSH connectivity confirmed"
+# Step 3: Deploy to all hosts
+FAILED_HOSTS=()
+SUCCESSFUL_HOSTS=()
 
-# Step 4: Transfer container to remote host
-log_info "Transferring container to remote host..."
-if scp "${TEMP_FILE}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"; then
-    log_success "Container transferred successfully"
-else
-    log_error "Failed to transfer container"
-    exit 1
+for REMOTE_HOST in "${REMOTE_HOSTS[@]}"; do
+    if deploy_to_host "${REMOTE_HOST}"; then
+        SUCCESSFUL_HOSTS+=("${REMOTE_HOST}")
+    else
+        FAILED_HOSTS+=("${REMOTE_HOST}")
+    fi
+    echo  # Add blank line between host deployments
+done
+
+# Step 4: Summary
+log_info "=== Deployment Summary ==="
+if [[ ${#SUCCESSFUL_HOSTS[@]} -gt 0 ]]; then
+    log_success "Successfully deployed to: ${SUCCESSFUL_HOSTS[*]}"
 fi
 
-# Step 5: Load container on remote host
-log_info "Loading container on remote host..."
-ssh "${REMOTE_USER}@${REMOTE_HOST}" << EOF
-set -e
-
-echo "Loading container image..."
-gunzip -c "${REMOTE_PATH}" | docker load
-
-echo "Verifying container was loaded..."
-if docker images --format "table {{.Repository}}:{{.Tag}}" | grep -q "^${CONTAINER_IMAGE}$"; then
-    echo "✅ Container loaded successfully"
-    docker images | grep bitw_xdp
-else
-    echo "❌ Container failed to load"
+if [[ ${#FAILED_HOSTS[@]} -gt 0 ]]; then
+    log_error "Failed to deploy to: ${FAILED_HOSTS[*]}"
     exit 1
 fi
 
-echo "Cleaning up remote temp file..."
-rm -f "${REMOTE_PATH}"
-EOF
-
-if [[ $? -eq 0 ]]; then
-    log_success "Container deployment completed successfully!"
-    log_info ""
-    log_info "The container is now available on ${REMOTE_HOST} as: ${CONTAINER_IMAGE}"
-    log_info ""
-    log_info "To run the container on the remote host:"
-    log_info "  ssh ${REMOTE_USER}@${REMOTE_HOST}"
-    log_info "  sudo docker run --privileged --network=host --rm \\"
-    log_info "    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \\"
-    log_info "    ${CONTAINER_IMAGE} PF0 PF1 --sample.sampling=1000 --sample.ethertypes=0x800"
-else
-    log_error "Container deployment failed on remote host"
-    exit 1
-fi
+log_success "All deployments completed successfully!"
+log_info ""
+log_info "The container is now available on all target hosts as: ${CONTAINER_IMAGE}"
+log_info ""
+log_info "To run the container on encoder/decoder hosts:"
+log_info "  ssh root@encoder  # or decoder"
+log_info "  cd /root  # or wherever you want to run from"
+log_info "  podman run --privileged --network=host --rm \\"
+log_info "    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \\"
+log_info "    ${CONTAINER_IMAGE} eth0 eth1 --sample.sampling=1000 --sample.ethertypes=0x800"
+log_info ""
+log_info "Example S-Flow usage:"
+log_info "  # On encoder: Run bitw_sflow to sample and watermark packets"
+log_info "  podman run --privileged --network=host --rm \\"
+log_info "    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \\"
+log_info "    ${CONTAINER_IMAGE} --mode sflow eth0 eth1 --sample.sampling=1000 --sample.ethertypes=0x800"
+log_info ""
+log_info "  # On decoder: Run bitw_filter to detect and remove watermarks"
+log_info "  podman run --privileged --network=host --rm \\"
+log_info "    -v /sys/fs/bpf:/sys/fs/bpf -v /sys:/sys -v /proc:/proc \\"
+log_info "    ${CONTAINER_IMAGE} --mode filter eth0 eth1"
