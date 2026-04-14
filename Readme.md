@@ -580,7 +580,9 @@ This project follows standard C++ development practices:
 
 ## 📄 License
 
-See project license file for terms and conditions.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+Copyright 2026 Intel Corporation
 
 ---
 
