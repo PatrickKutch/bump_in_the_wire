@@ -47,6 +47,7 @@ sudo ./bitw_sflow <interface_A> <interface_B> [options]
 - `--sample.sampling N` - Sample 1 out of N packets (0=disabled)
 - `--sample.ethertypes LIST` - Comma-separated EtherTypes (e.g., 0x800,0x86DD)
 - `--sample.dest_mac MAC` - Magic MAC for watermarked packets (default: 02:00:00:00:00:01)
+- `--sample.jitter Min,Max` - Apply random timestamp jitter (Min-Max nanoseconds) to watermarked packets
 - `--cpu.forwarding N[,M]` - Pin forwarding thread to CPU N (or N,M for timestamping performance)
 - `--cpu.return M` - Pin return thread to CPU M
 - `--i226-mode` - Intel I226 optimization mode
@@ -271,6 +272,10 @@ sudo ./bitw_sflow eth0 eth1 --sample.sampling=10000 --sample.ethertypes=0x800,0x
 # Skip VLAN tags and use hardware timestamping
 sudo ./bitw_sflow eth0 eth1 --sample.sampling=10000 --sample.ethertypes=0x800 \
     --sample.skip_vlan=true --sample.hw_timestamp=true
+
+# With timestamp jitter for latency distribution analysis
+sudo ./bitw_sflow eth0 eth1 --sample.sampling=10000 --sample.ethertypes=0x800 \
+    --sample.jitter=500000,1500000 --sample.hw_timestamp=true
 ```
 
 **Watermark Filtering:**
