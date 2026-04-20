@@ -306,6 +306,13 @@ sudo ./afx_tx eth0 aa:bb:cc:dd:ee:ff 500 --i226-mode --verbose --duration 30
 
 The `run-container.sh` script provides the easiest way to run containerized versions:
 
+**Features:**
+- Automatic runtime detection (prefers Podman, falls back to Docker)
+- Pre-flight interface validation and XDP cleanup
+- Support for all three program modes: `sflow`, `filter`, `afx_tx`
+- Background execution with `--detach` flag and named containers
+- Comprehensive help and usage examples
+
 **S-Flow Sampling:**
 ```bash
 # Basic S-Flow forwarding
@@ -313,6 +320,9 @@ sudo ./run-container.sh eth0 eth1
 
 # With sampling configuration
 sudo ./run-container.sh --mode sflow eth0 eth1 --sample.sampling=10000 --sample.ethertypes=0x800
+
+# Run in background (detached mode)
+sudo ./run-container.sh --detach --mode sflow eth0 eth1 --sample.sampling=10000 --sample.ethertypes=0x800
 
 # With verbose debugging
 sudo ./run-container.sh eth0 eth1 --verbose
@@ -325,6 +335,9 @@ sudo ./run-container.sh --mode filter eth0 eth1
 
 # With CPU pinning
 sudo ./run-container.sh --mode filter eth0 eth1 --cpu.forwarding 4,5 --cpu.return 8
+
+# Run in background with named container
+sudo ./run-container.sh --detach --mode filter eth0 eth1 --cpu.forwarding 4,5
 ```
 
 **Transmission Testing:**
@@ -334,6 +347,9 @@ sudo ./run-container.sh --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000
 
 # With I226 optimizations
 sudo ./run-container.sh --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000 --i226-mode --verbose
+
+# Run in background for long-term testing
+sudo ./run-container.sh --detach --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000 --i226-mode
 ```
 
 ### Direct Container Commands
@@ -381,6 +397,33 @@ sudo podman run --privileged --network=host --rm \
 # For detached containers
 sudo docker logs -f <container_name>
 sudo podman logs -f <container_name>
+```
+
+### Background Container Management
+
+The `--detach` option runs containers in the background with predictable names based on the program mode:
+
+**Container Names:**
+- `sflow` - S-Flow sampling container  
+- `filter` - Watermark filtering container
+- `afx_tx` - AF_XDP transmission test container
+
+**Managing Background Containers:**
+```bash
+# Start in background
+sudo ./run-container.sh --detach --mode sflow eth0 eth1 --sample.sampling=1000
+
+# View logs from detached container
+sudo docker logs -f sflow
+sudo podman logs -f filter
+
+# Stop background container by name
+sudo docker stop sflow
+sudo podman stop filter
+
+# List running containers
+sudo docker ps
+sudo podman ps
 ```
 
 ### Container Privileges and Mounts

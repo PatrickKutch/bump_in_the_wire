@@ -505,13 +505,13 @@ static void print_usage(const char* prog) {
     std::cerr
         << "Usage: " << prog << " <netdev_A> <netdev_B> [options]\n"
         << "\nWatermark Packet Filter with AF_XDP\n"
-        << "Detects and drops TCP packets with watermark signatures (Reserved bits + hash+timestamp payload)\n"
+        << "Detects and drops TCP packets with watermark signatures based on magic MAC address filtering\n"
         << "\nCPU Pinning:\n"
         << "  --cpu.forwarding N[,M]  Pin A→B worker thread to CPU N (optionally second core M)\n"
         << "  --cpu.return M          Pin B→A worker thread to CPU M\n"
         << "\nWatermark Filtering:\n"
         << "  --watermark.dest_mac MAC  Magic destination MAC for watermark detection (e.g. 02:00:00:00:00:01)\n"
-        << "                            Only packets with this magic MAC will be checked for watermarks\n"
+        << "                            Only packets with this destination MAC are analyzed for watermarks\n"
         << "                            (default: 02:00:00:00:00:01)\n"
         << "  --watermark.hw_timestamp B Use hardware timestamp (true/false, default: false)\n"
         << "\nHardware Compatibility:\n"
@@ -528,8 +528,9 @@ static void print_usage(const char* prog) {
         << "  " << prog << " eth0 eth1 --watermark.dest_mac=02:00:00:00:00:01\n"
         << "  " << prog << " eth0 eth1 --watermark.dest_mac=02:00:00:00:00:01 --log-level INFO\n"
         << "\nWatermark Detection:\n"
-        << "  - Looks for TCP packets with non-zero Reserved bits\n"
-        << "  - Expects 16-byte payload containing [hash:8][timestamp:8]\n"
+        << "  - Uses magic destination MAC address to identify potential watermarked packets\n"
+        << "  - Only packets matching the magic MAC are analyzed for watermark content\n"
+        << "  - Expects 16-byte payload containing [hash:8][timestamp:8] in detected packets\n"
         << "  - Validates timestamp is within reasonable bounds\n"
         << "  - Drops watermarked packets from A→B, forwards B→A normally\n";
 }

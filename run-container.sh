@@ -34,12 +34,29 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 PROGRAM_MODE="sflow"  # Default mode
+DETACH_MODE=false      # Default to foreground
 
-# Parse mode option if provided
-if [ "$1" = "--mode" ] && [ $# -ge 2 ]; then
-    PROGRAM_MODE="$2"
-    shift 2
-fi
+# Parse options
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode)
+            if [ $# -ge 2 ]; then
+                PROGRAM_MODE="$2"
+                shift 2
+            else
+                echo "❌ Error: --mode requires a value"
+                exit 1
+            fi
+            ;;
+        --detach)
+            DETACH_MODE=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 # Validate arguments based on mode
 if [ "$PROGRAM_MODE" = "afx_tx" ]; then
@@ -49,7 +66,7 @@ if [ "$PROGRAM_MODE" = "afx_tx" ]; then
         echo ""
         echo "Container runtime: $CONTAINER_RUNTIME"
         echo ""
-        echo "Usage (afx_tx mode): $0 --mode afx_tx <interface> <dest_mac> <interval_ms> [additional_options]"
+        echo "Usage (afx_tx mode): $0 [--detach] --mode afx_tx <interface> <dest_mac> <interval_ms> [additional_options]"
         echo ""
         echo "AFX_TX Mode - Standalone AF_XDP TX Test Program:"
         echo "  <interface>   Network interface (e.g., eth0)"
@@ -57,6 +74,7 @@ if [ "$PROGRAM_MODE" = "afx_tx" ]; then
         echo "  <interval_ms> Packet transmission interval in milliseconds"
         echo ""
         echo "Options:"
+        echo "  --detach      Run container in background (detached mode)"
         echo "  --i226-mode   Use I226-optimized AF_XDP settings"
         echo "  --verbose     Enable verbose packet logging"
         echo ""
@@ -75,7 +93,11 @@ elif [ $# -lt 2 ]; then
     echo ""
     echo "Container runtime: $CONTAINER_RUNTIME"
     echo ""
-    echo "Usage: $0 [--mode sflow|filter] <interface_A> <interface_B> [additional_options]"
+    echo "Usage: $0 [--detach] [--mode sflow|filter] <interface_A> <interface_B> [additional_options]"
+    echo ""
+    echo "Options:"
+    echo "  --detach      Run container in background (detached mode)"
+    echo "  --mode MODE   Program mode (sflow, filter, afx_tx)"
     echo ""
     echo "Modes:"
     echo "  sflow   - S-Flow sampling with TCP watermarking (default)"
@@ -86,7 +108,7 @@ elif [ $# -lt 2 ]; then
     echo "  sudo $0 PF0 PF1"
     echo "  sudo $0 --mode sflow PF0 PF1 --sample.sampling 1000 --sample.ethertypes=0x800"
     echo "  sudo $0 --mode filter PF0 PF1 --cpu.forwarding 2"
-    echo "  sudo $0 --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000 --i226-mode"
+    echo "  sudo $0 --detach --mode afx_tx eth0 aa:bb:cc:dd:ee:ff 1000 --i226-mode"
     echo "  sudo BUMP_VERBOSE=1 $0 eth0 eth1"
     echo ""
     echo "Available interfaces:"
@@ -119,6 +141,12 @@ fi
 echo "🚀 Starting bitw_${PROGRAM_MODE} container..."
 echo "   Container runtime: $CONTAINER_RUNTIME"
 echo "   Mode: $PROGRAM_MODE"
+echo "   Container name: $PROGRAM_MODE"
+if [ "$DETACH_MODE" = "true" ]; then
+    echo "   Running in: detached mode (background)"
+else
+    echo "   Running in: foreground mode"
+fi
 if [ "$PROGRAM_MODE" = "afx_tx" ]; then
     echo "   Interface: $INTERFACE_A"
 else
@@ -153,6 +181,8 @@ if [ "$CONTAINER_RUNTIME" = "podman" ]; then
         --privileged \
         --network=host \
         --rm \
+        --name "$PROGRAM_MODE" \
+        $(if [ "$DETACH_MODE" = "true" ]; then echo "--detach"; fi) \
         -v /sys/fs/bpf:/sys/fs/bpf \
         -v /sys:/sys \
         -v /proc:/proc \
@@ -165,6 +195,8 @@ else
         --privileged \
         --network=host \
         --rm \
+        --name "$PROGRAM_MODE" \
+        $(if [ "$DETACH_MODE" = "true" ]; then echo "--detach"; fi) \
         -v /sys/fs/bpf:/sys/fs/bpf \
         -v /sys:/sys \
         -v /proc:/proc \
